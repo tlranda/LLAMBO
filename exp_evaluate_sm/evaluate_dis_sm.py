@@ -30,6 +30,13 @@ def setup_logging(log_name):
     logger.addHandler(file_handler)
     logger.setLevel(logging.INFO)
 
+def load_precomputed_samples(hp_constraints, n, dataset_name, model, dataset):
+    # For purposes here, the train/test split does not matter, re-unify them
+    all_x = np.vstack((dataset['train_x'], dataset['test_x']))
+    all_y = np.hstack((dataset['train_y'], dataset['test_y']))
+    sampled_configs = pd.DataFrame(all_x, columns=list(hp_constraints.keys()))
+    sampled_scores = pd.DataFrame(all_y, columns=['score'])
+    return sampled_configs, sampled_scores
 
 def obtain_n_configurations(hp_constraints, n, dataset, model, task_metric, task_type, lower_is_better):
     # run random sampled hyperaparameter configurations with optuna
@@ -210,6 +217,7 @@ TASK_MAP = {
     'wine': ['classification', 'accuracy'],
     'iris': ['classification', 'accuracy'],
     'diabetes': ['regression', 'neg_mean_squared_error'],
+    'syr2k': ['regression', 'neg_mean_squared_error'],
 }
 
 
@@ -220,6 +228,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_observed', type=int)
     parser.add_argument('--num_seeds', type=int)
     parser.add_argument('--engine', type=str)
+    parser.add_argument('--evaluate', nargs='+', required=True, default=None, choices=['GP','SMAC','LLAMBO','LLAMBO_VANILLA'])
 
     args = parser.parse_args()
     model = args.model
@@ -227,6 +236,7 @@ if __name__ == '__main__':
     num_observed = args.num_observed
     num_seeds = args.num_seeds
     engine = args.engine
+    to_evaluate = args.evaluate
 
     # load hyperparameter config space
     with open(f'hp_configurations/bayesmark.json', 'r') as f:
@@ -258,26 +268,19 @@ if __name__ == '__main__':
         dataset = pickle.load(f)
 
     results = {}
-    results['GP'] = {'rmse': [], 'r2': [], 
-                     'nll': [], 'mace': [], 'sharpness': [], 'observed_coverage': [],
-                     'regret': [], 'y_pred': [], 'y_std': [], 'y_true': []}
-    results['SMAC'] = {'rmse': [], 'r2': [], 
-                     'nll': [], 'mace': [], 'sharpness': [], 'observed_coverage': [],
-                     'regret': [], 'y_pred': [], 'y_std': [], 'y_true': []}
-    results['LLAMBO'] = {'rmse': [], 'r2': [], 
-                     'nll': [], 'mace': [], 'sharpness': [], 'observed_coverage': [],
-                     'regret': [], 'y_pred': [], 'y_std': [], 'y_true': [],
-                     'llm_query_cost': [], 'llm_query_time': []}
-    results['LLAMBO_VANILLA'] = {'rmse': [], 'r2': [], 
-                     'nll': [], 'mace': [], 'sharpness': [], 'observed_coverage': [],
-                     'regret': [], 'y_pred': [], 'y_std': [], 'y_true': [],
-                     'llm_query_cost': [], 'llm_query_time': []}
+    for evaluator in to_evaluate:
+        results[evaluator] = dict((key, list()) for key in ['rmse','r2','nll','mace','sharpness','observed_coverage',
+                                                            'regret','y_pred','y_std','y_true'])
+        if 'LLAMBO' in evaluator:
+            results[evaluator].update(dict((key, list()) for key in ['llm_query_cost','llm_query_time']))
     lower_is_better = False if task_metric == 'accuracy' else True
 
     logger.info(f'Collecting configurations - this might take a while...')
-    sampled_configs, sampled_scores = obtain_n_configurations(hp_constraints, 100, dataset, model, 
-                                                              task_metric=task_metric, task_type=task_type, lower_is_better=lower_is_better)
-
+    if model.startswith('DatasetIdentity:'):
+        sampled_configs, sampled_scores = load_precomputed_samples(hp_constraints, 100, dataset, model, dataset)
+    else:
+        sampled_configs, sampled_scores = obtain_n_configurations(hp_constraints, 100, dataset, model,
+                                                                  task_metric=task_metric, task_type=task_type, lower_is_better=lower_is_better)
 
     tot_llm_cost = 0
     for seed in range(num_seeds):
@@ -285,49 +288,47 @@ if __name__ == '__main__':
         logger.info(f'Evaluating SM with seed {seed}...')
 
         observed_configs, observed_fvals = sample_n_configurations(sampled_configs, sampled_scores, num_observed, seed=seed)
-
-        candidate_configs, candidate_fvals = sample_n_configurations(sampled_configs, sampled_scores, 10, 
-                                                                     seed=42)
-        
+        candidate_configs, candidate_fvals = sample_n_configurations(sampled_configs, sampled_scores, 10, seed=42)
         f_best = observed_fvals.min().item() if lower_is_better else observed_fvals.max().item()
 
         # evaluate GP
-        y_pred, y_std = fit_and_predict_with_GP(hp_constraints, observed_configs, observed_fvals, candidate_configs)
-        scores = evaluate_posterior(y_pred, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
-        rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
-        logger.info(f"[GP] RMSE: {rmse:.4f}, R2 score: {r2:.4f}, NLL: {nll:.4f}, "
-                    f"Coverage: {observed_coverage:.4f}, MACE: {mace:.4f}, Sharpness: {sharpness:.4f}, Regret: {regret:.4f}")
-        results['GP']['rmse'].append(rmse)
-        results['GP']['r2'].append(r2)
-        results['GP']['nll'].append(nll)
-        results['GP']['mace'].append(mace)
-        results['GP']['sharpness'].append(sharpness)
-        results['GP']['observed_coverage'].append(observed_coverage)
-        results['GP']['regret'].append(regret)
-        results['GP']['y_pred'].append(y_pred.squeeze().tolist())
-        results['GP']['y_std'].append(y_std.squeeze().tolist())
-        results['GP']['y_true'].append(candidate_fvals.to_numpy().squeeze().tolist())
-
+        if 'GP' in to_evaluate:
+            y_pred, y_std = fit_and_predict_with_GP(hp_constraints, observed_configs, observed_fvals, candidate_configs)
+            scores = evaluate_posterior(y_pred, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
+            rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
+            logger.info(f"[GP] RMSE: {rmse:.4f}, R2 score: {r2:.4f}, NLL: {nll:.4f}, "
+                        f"Coverage: {observed_coverage:.4f}, MACE: {mace:.4f}, Sharpness: {sharpness:.4f}, Regret: {regret:.4f}")
+            results['GP']['rmse'].append(rmse)
+            results['GP']['r2'].append(r2)
+            results['GP']['nll'].append(nll)
+            results['GP']['mace'].append(mace)
+            results['GP']['sharpness'].append(sharpness)
+            results['GP']['observed_coverage'].append(observed_coverage)
+            results['GP']['regret'].append(regret)
+            results['GP']['y_pred'].append(y_pred.squeeze().tolist())
+            results['GP']['y_std'].append(y_std.squeeze().tolist())
+            results['GP']['y_true'].append(candidate_fvals.to_numpy().squeeze().tolist())
 
         # evaluate SMAC
-        y_pred, y_std = fit_and_predict_with_SMAC(hp_constraints, observed_configs, observed_fvals, candidate_configs)
-        scores = evaluate_posterior(y_pred, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
-        rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
-        logger.info(f"[SMAC] RMSE: {rmse:.4f}, R2 score: {r2:.4f}, NLL: {nll:.4f}, "
-                    f"Coverage: {observed_coverage:.4f}, MACE: {mace:.4f}, Sharpness: {sharpness:.4f}, Regret: {regret:.4f}")
-        results['SMAC']['rmse'].append(rmse)
-        results['SMAC']['r2'].append(r2)
-        results['SMAC']['nll'].append(nll)
-        results['SMAC']['mace'].append(mace)
-        results['SMAC']['sharpness'].append(sharpness)
-        results['SMAC']['observed_coverage'].append(observed_coverage)
-        results['SMAC']['regret'].append(regret)
-        results['SMAC']['y_pred'].append(y_pred.squeeze().tolist())
-        results['SMAC']['y_std'].append(y_std.squeeze().tolist())
-        results['SMAC']['y_true'].append(candidate_fvals.to_numpy().squeeze().tolist())
+        if 'SMAC' in to_evaluate: #not model.startswith('DatasetIdentity:'):
+            y_pred, y_std = fit_and_predict_with_SMAC(hp_constraints, observed_configs, observed_fvals, candidate_configs)
+            scores = evaluate_posterior(y_pred, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
+            rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
+            logger.info(f"[SMAC] RMSE: {rmse:.4f}, R2 score: {r2:.4f}, NLL: {nll:.4f}, "
+                        f"Coverage: {observed_coverage:.4f}, MACE: {mace:.4f}, Sharpness: {sharpness:.4f}, Regret: {regret:.4f}")
+            results['SMAC']['rmse'].append(rmse)
+            results['SMAC']['r2'].append(r2)
+            results['SMAC']['nll'].append(nll)
+            results['SMAC']['mace'].append(mace)
+            results['SMAC']['sharpness'].append(sharpness)
+            results['SMAC']['observed_coverage'].append(observed_coverage)
+            results['SMAC']['regret'].append(regret)
+            results['SMAC']['y_pred'].append(y_pred.squeeze().tolist())
+            results['SMAC']['y_std'].append(y_std.squeeze().tolist())
+            results['SMAC']['y_true'].append(candidate_fvals.to_numpy().squeeze().tolist())
 
 
-        # evaluate LLAMBO - calibrated
+        # prepare task context for LLAMBO-family of evaluators
         task_context = {}
         task_context['model'] = model
         task_context['task'] = task_type
@@ -339,55 +340,54 @@ if __name__ == '__main__':
         task_context['num_samples'] = dataset['train_x'].shape[0]
         task_context['hyperparameter_constraints'] = hp_constraints
 
-
-        LLM_SM = LLM_DIS_SM(task_context, n_gens=10, lower_is_better=lower_is_better, 
-                                bootstrapping=False, n_templates=5, use_recalibration=False,
-                                verbose=False, rate_limiter=rate_limiter, chat_engine=engine)
-        y_mean, y_std, cost, time_taken = asyncio.run(LLM_SM._evaluate_candidate_points(observed_configs, observed_fvals, candidate_configs))
-        scores = evaluate_posterior(y_mean, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
-        rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
-        logger.info(f"[LLAMBO] RMSE: {rmse:.4f}, R2 score: {r2:.4f}, NLL: {nll:.4f}, "
-                    f"Coverage: {observed_coverage:.4f}, MACE: {mace:.4f}, Sharpness: {sharpness:.4f}, Regret: {regret:.4f} | Cost: ${cost:.4f}, Time: {time_taken:.4f}s")
-        results['LLAMBO']['rmse'].append(rmse)
-        results['LLAMBO']['r2'].append(r2)
-        results['LLAMBO']['nll'].append(nll)
-        results['LLAMBO']['mace'].append(mace)
-        results['LLAMBO']['sharpness'].append(sharpness)
-        results['LLAMBO']['observed_coverage'].append(observed_coverage)
-        results['LLAMBO']['regret'].append(regret)
-        results['LLAMBO']['y_pred'].append(y_mean.squeeze().tolist())
-        results['LLAMBO']['y_std'].append(y_std.squeeze().tolist())
-        results['LLAMBO']['y_true'].append(candidate_fvals.to_numpy().squeeze().tolist())
-        results['LLAMBO']['llm_query_cost'].append(cost)
-        results['LLAMBO']['llm_query_time'].append(time_taken)
-
-        tot_llm_cost += cost
+        # evaluate LLAMBO - calibrated
+        if "LLAMBO" in to_evaluate:
+            LLM_SM = LLM_DIS_SM(task_context, n_gens=10, lower_is_better=lower_is_better,
+                                    bootstrapping=False, n_templates=5, use_recalibration=False,
+                                    verbose=False, rate_limiter=rate_limiter, chat_engine=engine)
+            y_mean, y_std, cost, time_taken = asyncio.run(LLM_SM._evaluate_candidate_points(observed_configs, observed_fvals, candidate_configs))
+            scores = evaluate_posterior(y_mean, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
+            rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
+            logger.info(f"[LLAMBO] RMSE: {rmse:.4f}, R2 score: {r2:.4f}, NLL: {nll:.4f}, "
+                        f"Coverage: {observed_coverage:.4f}, MACE: {mace:.4f}, Sharpness: {sharpness:.4f}, Regret: {regret:.4f} | Cost: ${cost:.4f}, Time: {time_taken:.4f}s")
+            results['LLAMBO']['rmse'].append(rmse)
+            results['LLAMBO']['r2'].append(r2)
+            results['LLAMBO']['nll'].append(nll)
+            results['LLAMBO']['mace'].append(mace)
+            results['LLAMBO']['sharpness'].append(sharpness)
+            results['LLAMBO']['observed_coverage'].append(observed_coverage)
+            results['LLAMBO']['regret'].append(regret)
+            results['LLAMBO']['y_pred'].append(y_mean.squeeze().tolist())
+            results['LLAMBO']['y_std'].append(y_std.squeeze().tolist())
+            results['LLAMBO']['y_true'].append(candidate_fvals.to_numpy().squeeze().tolist())
+            results['LLAMBO']['llm_query_cost'].append(cost)
+            results['LLAMBO']['llm_query_time'].append(time_taken)
+            tot_llm_cost += cost
 
 
         # evaluate LLAMBO - vanilla
-        LLM_SM = LLM_DIS_SM(task_context, n_gens=10, lower_is_better=lower_is_better, 
-                                bootstrapping=False, n_templates=1, use_recalibration=False,
-                                verbose=False, rate_limiter=rate_limiter, chat_engine=engine)
-        y_mean, y_std, cost, time_taken = asyncio.run(LLM_SM._evaluate_candidate_points(observed_configs, observed_fvals, candidate_configs))
-        scores = evaluate_posterior(y_mean, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
-        rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
-        logger.info(f"[LLAMBO_VANILLA] RMSE: {rmse:.4f}, R2 score: {r2:.4f}, NLL: {nll:.4f}, "
-                    f"Coverage: {observed_coverage:.4f}, MACE: {mace:.4f}, Sharpness: {sharpness:.4f}, Regret: {regret:.4f} | Cost: ${cost:.4f}, Time: {time_taken:.4f}s")
-        results['LLAMBO_VANILLA']['rmse'].append(rmse)
-        results['LLAMBO_VANILLA']['r2'].append(r2)
-        results['LLAMBO_VANILLA']['nll'].append(nll)
-        results['LLAMBO_VANILLA']['mace'].append(mace)
-        results['LLAMBO_VANILLA']['sharpness'].append(sharpness)
-        results['LLAMBO_VANILLA']['observed_coverage'].append(observed_coverage)
-        results['LLAMBO_VANILLA']['regret'].append(regret)
-        results['LLAMBO_VANILLA']['y_pred'].append(y_mean.squeeze().tolist())
-        results['LLAMBO_VANILLA']['y_std'].append(y_std.squeeze().tolist())
-        results['LLAMBO_VANILLA']['y_true'].append(candidate_fvals.to_numpy().squeeze().tolist())
-        results['LLAMBO_VANILLA']['llm_query_cost'].append(cost)
-        results['LLAMBO_VANILLA']['llm_query_time'].append(time_taken)
-        
-        tot_llm_cost += cost
-
+        if "LLAMBO_VANILLA" in to_evaluate:
+            LLM_SM = LLM_DIS_SM(task_context, n_gens=10, lower_is_better=lower_is_better,
+                                    bootstrapping=False, n_templates=1, use_recalibration=False,
+                                    verbose=False, rate_limiter=rate_limiter, chat_engine=engine)
+            y_mean, y_std, cost, time_taken = asyncio.run(LLM_SM._evaluate_candidate_points(observed_configs, observed_fvals, candidate_configs))
+            scores = evaluate_posterior(y_mean, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
+            rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
+            logger.info(f"[LLAMBO_VANILLA] RMSE: {rmse:.4f}, R2 score: {r2:.4f}, NLL: {nll:.4f}, "
+                        f"Coverage: {observed_coverage:.4f}, MACE: {mace:.4f}, Sharpness: {sharpness:.4f}, Regret: {regret:.4f} | Cost: ${cost:.4f}, Time: {time_taken:.4f}s")
+            results['LLAMBO_VANILLA']['rmse'].append(rmse)
+            results['LLAMBO_VANILLA']['r2'].append(r2)
+            results['LLAMBO_VANILLA']['nll'].append(nll)
+            results['LLAMBO_VANILLA']['mace'].append(mace)
+            results['LLAMBO_VANILLA']['sharpness'].append(sharpness)
+            results['LLAMBO_VANILLA']['observed_coverage'].append(observed_coverage)
+            results['LLAMBO_VANILLA']['regret'].append(regret)
+            results['LLAMBO_VANILLA']['y_pred'].append(y_mean.squeeze().tolist())
+            results['LLAMBO_VANILLA']['y_std'].append(y_std.squeeze().tolist())
+            results['LLAMBO_VANILLA']['y_true'].append(candidate_fvals.to_numpy().squeeze().tolist())
+            results['LLAMBO_VANILLA']['llm_query_cost'].append(cost)
+            results['LLAMBO_VANILLA']['llm_query_time'].append(time_taken)
+            tot_llm_cost += cost
 
         # save results
         with open(save_res_fpath, 'w') as f:
@@ -395,3 +395,4 @@ if __name__ == '__main__':
 
     logger.info('='*200)
     logger.info(f'[LLAMBO] {num_seeds} evaluation runs complete! Total cost: ${tot_llm_cost:.4f}')
+

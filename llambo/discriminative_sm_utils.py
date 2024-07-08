@@ -1,6 +1,6 @@
 import numpy as np
-from langchain import FewShotPromptTemplate
-from langchain import PromptTemplate
+from langchain.prompts import FewShotPromptTemplate
+from langchain.prompts import PromptTemplate
 
 def _count_decimal_places(n):
     '''Count the number of decimal places in a number.'''
@@ -75,6 +75,8 @@ def prepare_configurations(
                     row_string += f'{row[i]:.{n_dp}f}'
                 elif hyp_type == 'ordinal':
                     row_string += f'{row[i]:.{n_dp}f}'
+                elif hyp_type == 'categorical':
+                    row_string += str(row[i])
                 else:
                     row_string += row[i]
 
@@ -85,6 +87,8 @@ def prepare_configurations(
                     row_string += f'{row[i]:.{n_dp}f}'
                 elif hyp_type == 'ordinal':
                     row_string += f'{row[i]:.{n_dp}f}'
+                elif hyp_type == 'categorical':
+                    row_string += str(row[i])
                 else:
                     row_string += row[i]
 

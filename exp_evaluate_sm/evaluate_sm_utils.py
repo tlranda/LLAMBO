@@ -2,12 +2,30 @@ import numpy as np
 import optuna
 from optuna.samplers import TPESampler
 
+def make_configspace(seed, hp_constraints):
+    from ConfigSpace import ConfigurationSpace, Float, Integer, Categorical
+    cs = ConfigurationSpace(seed=seed)
+    for hp_name, hp_info in hp_constraints.items():
+        _type, transform, hp_values = hp_info
+        use_log = transform == 'log'
+        if _type == 'int':
+            cs.add_hyperparameter(Integer(hp_name, hp_values, log=use_log))
+        elif _type == 'float':
+            cs.add_hyperparameter(Float(hp_name, hp_values, log=use_log))
+        elif _type == 'categorical':
+            # For now, all categoricals use uniform weight, but that might not be what's requested
+            if transform != 'uniform':
+                raise NotImplemented("All categorical variables are currently uniform weights -- must implement capability for special weights")
+            cs.add_hyperparameter(Categorical(hp_name, hp_values))
+        else:
+            raise NotImplemented(_type)
+    return cs
+
 def fit_and_predict_with_GP(hp_constraints, X_train, y_train, X_test):
     '''Return predictions on surrogate model from GP.'''
     # NOTE: X_train, X_test are hyperparameter configurations, y_train is the corresponding validation error
 
     from smac.model.gaussian_process import GaussianProcess
-    from ConfigSpace import ConfigurationSpace, Float, Integer
     from smac.model.gaussian_process.kernels import ConstantKernel, MaternKernel, ProductKernel
     from sklearn.preprocessing import StandardScaler
 
@@ -17,19 +35,7 @@ def fit_and_predict_with_GP(hp_constraints, X_train, y_train, X_test):
 
     # The ConfigSpace doesn't matter here, we just need to create a ConfigurationSpace object to use the GP
     # https://automl.github.io/SMAC3/main/_modules/smac/model/gaussian_process/gaussian_process.html#GaussianProcess
-    cs = ConfigurationSpace(seed=42)
-    for hp_name, hp_info in hp_constraints.items():
-        type, transform, [hp_min, hp_max] = hp_info
-        if type == 'int':
-            if transform == 'log':
-                cs.add_hyperparameter(Integer(hp_name, (hp_min, hp_max), log=True))
-            else:
-                cs.add_hyperparameter(Integer(hp_name, (hp_min, hp_max), log=False))
-        elif type == 'float':
-            if transform == 'log':
-                cs.add_hyperparameter(Float(hp_name, (hp_min, hp_max), log=True))
-            else:
-                cs.add_hyperparameter(Float(hp_name, (hp_min, hp_max), log=False))
+    cs = make_configspace(42, hp_constraints)
 
     X_train = X_train.to_numpy()
     y_train = y_train.to_numpy()
@@ -58,7 +64,6 @@ def fit_and_predict_with_SMAC(hp_constraints, X_train, y_train, X_test):
     '''Return predictions on surrogate model from SMAC.'''
 
     from smac.model.random_forest import RandomForest
-    from ConfigSpace import ConfigurationSpace, Float, Integer
 
     config_space_dict = {}
 
@@ -66,19 +71,7 @@ def fit_and_predict_with_SMAC(hp_constraints, X_train, y_train, X_test):
     X_test = X_test.copy()
     y_train = y_train.copy()
 
-    cs = ConfigurationSpace(seed=42)
-    for hp_name, hp_info in hp_constraints.items():
-        type, transform, [hp_min, hp_max] = hp_info
-        if type == 'int':
-            if transform == 'log':
-                cs.add_hyperparameter(Integer(hp_name, (hp_min, hp_max), log=True))
-            else:
-                cs.add_hyperparameter(Integer(hp_name, (hp_min, hp_max), log=False))
-        elif type == 'float':
-            if transform == 'log':
-                cs.add_hyperparameter(Float(hp_name, (hp_min, hp_max), log=True))
-            else:
-                cs.add_hyperparameter(Float(hp_name, (hp_min, hp_max), log=False))
+    cs = make_configspace(42, hp_constraints)
 
     X_train = X_train.to_numpy()
     y_train = y_train.to_numpy()

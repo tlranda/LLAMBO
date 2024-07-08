@@ -64,20 +64,51 @@ class LLM_DIS_SM:
 
             resp = None
             n_preds = int(self.n_gens/self.n_templates) if self.bootstrapping else int(self.n_gens)
+            # e.g. for 5 templates, get 2 generations per template
+            n_generations = max(n_preds, 3)
             for retry in range(MAX_RETRIES):
                 try:
-                    start_time = time.time()
-                    self.rate_limiter.add_request(request_text=user_message, current_time=start_time)
-                    resp = await openai.ChatCompletion.acreate(
-                        engine=self.chat_engine,
-                        messages=message,
-                        temperature=0.7,
-                        max_tokens=8,
-                        top_p=0.95,
-                        n=max(n_preds, 3),            # e.g. for 5 templates, get 2 generations per template
-                        request_timeout=10
-                    )
+                    self.rate_limiter.add_request(request_text=user_message, current_time=time.time())
+                    openai_kwargs = {'messages': message,
+                                     'temperature': 0.7,
+                                     'top_p': 0.95,
+                                     'max_tokens': 8,
+                                     'request_timeout': None, # Formerly 10
+                                    }
+                    if self.chat_engine == 'llama3':
+                        # Ollama needs this to be the MODEL argument
+                        openai_kwargs.update({'model': self.chat_engine})
+                    else:
+                        # OpenAI API needs this to be the ENGINE argument
+                        openai_kwargs.udpate({'engine': self.chat_engine})
+                        # OpenAI API can generate multiple responses on this call
+                        openai_kwargs.update({'n': n_generations})
+                    resp = await openai.ChatCompletion.acreate(**openai_kwargs)
                     self.rate_limiter.add_request(request_token_count=resp['usage']['total_tokens'], current_time=time.time())
+                    # Using Ollama, call multiple times for n_generations
+                    other_resps = []
+                    if self.chat_engine == 'llama3':
+                        for i in range(n_generations-1):
+                            self.rate_limiter.add_request(request_text=user_message, current_time=time.time())
+                            # Ensure seeds change so you don't always get the exact same response
+                            if 'seed' in openai_kwargs:
+                                openai_kwargs['seed'] += 1
+                            bonus_resp = await openai.ChatCompletion.acreate(**openai_kwargs)
+                            self.rate_limiter.add_request(request_token_count=bonus_resp['usage']['total_tokens'], current_time=time.time())
+                            other_resps.append(bonus_resp)
+                    # Merge all responses
+                    new_index = len(resp.choices)
+                    for bonus in other_resps:
+                        choices_index = list(bonus.keys()).index('choices')
+                        usage_index = list(bonus.keys()).index('usage')
+                        choices = list(bonus.values())[choices_index]
+                        usage = list(bonus.values())[usage_index]
+                        for use_key, use_value in usage.items():
+                            setattr(resp.usage,use_key,getattr(resp.usage,use_key)+use_value)
+                        for choice in choices:
+                            choice.index = new_index
+                            new_index += 1
+                        resp.choices.extend(choices)
                     break
                 except Exception as e:
                     print(f'[SM] RETRYING LLM REQUEST {retry+1}/{MAX_RETRIES}...')
@@ -130,39 +161,49 @@ class LLM_DIS_SM:
         bool_pred_returned = []
 
         # make predictions in chunks of 5, for each chunk make concurent calls
-        for i in range(0, len(query_examples), 5):
-            query_chunk = query_examples[i:i+5]
+        n_concurrent = 1 #5
+        #for i in range(0, len(query_examples), n_concurrent):
+        i = 0
+        while i < len(query_examples):
+            query_chunk = query_examples[i:i+n_concurrent]
             chunk_results = await self._generate_concurrently(all_prompt_templates, query_chunk)
             bool_pred_returned.extend([1 if x is not None else 0 for x in chunk_results])                # track effective number of predictions returned
-
             for _, sample_response in enumerate(chunk_results):
                 if not sample_response:     # if sample prediction is an empty list :(
                     sample_preds = [np.nan] * self.n_gens
                 else:
                     sample_preds = []
                     all_gens_text = [x['message']['content'] for template_response in sample_response for x in template_response[0]['choices'] ]        # fuarr this is some high level programming
+                    print(f"Query: {query_chunk}")
+                    print(f"Response: {all_gens_text}")
                     for gen_text in all_gens_text:
                         gen_pred = re.findall(r"## (-?[\d.]+) ##", gen_text)
                         if len(gen_pred) == 1:
                             sample_preds.append(float(gen_pred[0]))
                         else:
                             sample_preds.append(np.nan)
-                            
                     while len(sample_preds) < self.n_gens:
                         sample_preds.append(np.nan)
-
                     tot_cost += sum([x[1] for x in sample_response])
                     tot_tokens += sum([x[2] for x in sample_response])
                 all_preds.append(sample_preds)
-        
+            # This deletion may need to be re-examined if I turn on concurrent responses again
+            if np.isnan(sample_preds).all():
+                del bool_pred_returned[-n_concurrent:]
+            else:
+                i += n_concurrent
         end = time.time()
         time_taken = end - start
 
-        success_rate = sum(bool_pred_returned)/len(bool_pred_returned)
-
         all_preds = np.array(all_preds).astype(float)
-        y_mean = np.nanmean(all_preds, axis=1)
-        y_std = np.nanstd(all_preds, axis=1)
+        # Sometimes one or more row may have nothing except for nan values
+        has_atleast_one_value = np.argwhere(~np.isnan(all_preds).all(axis=1)).ravel()
+        has_all_nans = np.argwhere(np.isnan(all_preds).all(axis=1)).ravel()
+        success_rate = (sum(bool_pred_returned)-len(has_all_nans))/len(bool_pred_returned)
+
+        ok_preds = np.take(all_preds, has_atleast_one_value, axis=0)
+        y_mean = np.nanmean(ok_preds, axis=1)
+        y_std = np.nanstd(ok_preds, axis=1)
 
         # Capture failed calls - impute None with average predictions
         y_mean[np.isnan(y_mean)]  = np.nanmean(y_mean)

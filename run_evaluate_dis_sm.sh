@@ -3,7 +3,7 @@
 #!/bin/bash
 trap "kill -- -$BASHPID" EXIT
 
-ENGINE="gpt35turbo_20230727"
+ENGINE="llama3" #gpt35turbo_20230727"
 
 for dataset in "breast" "wine" "digits" "diabetes"
 do
