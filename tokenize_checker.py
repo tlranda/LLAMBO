@@ -11,6 +11,8 @@ import numpy as np
 def build():
     prs = argparse.ArgumentParser()
     prs.add_argument("-files", nargs="+", required=True, default=None, help="Text files to parse (each line is formatted as '#|#')")
+    prs.add_argument("-title", default=None, help="Plot title (defaults to filenames)")
+    prs.add_argument("-save", default=None, help="File to save image to (default: do not save, just display)")
     return prs
 
 def parse(args=None, prs=None):
@@ -103,7 +105,7 @@ def main(args=None):
                     substrings_with_n_tokens[n_tokens][subset] = [n_times, pprev]
             else:
                 substrings_with_n_tokens[n_tokens] = {subset: [n_times, pprev]}
-    #pprint.pprint(substrings_with_n_tokens)
+    pprint.pprint(substrings_with_n_tokens)
 
     # Largest width that needs processing determines center height
     center_height = max(map(len, substrings_with_n_tokens.values()))/2
@@ -183,14 +185,21 @@ def main(args=None):
                 tcolor = 'k'
             else:
                 tcolor = mcolors.to_hex(origin_colors[np.argmin(np.abs(origin_colors - mcolors.to_rgb(line_segment[0].get_color())).sum(axis=1)),:])
-            text = ax.text(xx,yy,tt,ha='center',va='bottom',zorder=10, color=tcolor)
+            text = ax.text(xx,yy,tt,ha='center',va='center',zorder=10, color=tcolor)
             text.set_bbox({'facecolor':'lightgray','alpha':0.8,'edgecolor':'none'})
         prev_ys = dict((k,v) for (k,v) in zip(untrimmed_substrs,ys)) 
+    if args.title is None:
+        ax.set_title(",".join(args.files))
+    else:
+        ax.set_title(args.title)
     orientations = ['bottom','top','left','right']
     orientations.extend([f'label{k}' for k in orientations])
     plt.tick_params(axis='both',which='both',**dict((k,False) for k in orientations))
     plt.tight_layout()
-    plt.show()
+    if not args.save:
+        plt.show()
+    else:
+        fig.savefig(args.save, dpi=300)
 
 if __name__ == "__main__":
     main()
