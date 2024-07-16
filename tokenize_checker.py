@@ -1,6 +1,7 @@
 import argparse
 import pprint
 from langchain_community.llms import ollama
+from transformers import GPT2TokenizerFast
 import matplotlib
 font = {'size': 8}
 matplotlib.rc('font', **font)
@@ -13,6 +14,7 @@ def build():
     prs.add_argument("-files", nargs="+", required=True, default=None, help="Text files to parse (each line is formatted as '#|#')")
     prs.add_argument("-title", default=None, help="Plot title (defaults to filenames)")
     prs.add_argument("-save", default=None, help="File to save image to (default: do not save, just display)")
+    prs.add_argument("--special-branching-colors", action="store_true", help="Attempt to apply consistent coloring scheme to initial color stems (default: %(default)s)")
     return prs
 
 def parse(args=None, prs=None):
@@ -23,8 +25,10 @@ def parse(args=None, prs=None):
     return args
 
 def get_tokenizer():
-    llm = ollama.Ollama(model='llama3')
-    return llm.get_num_tokens
+    #llm = ollama.Ollama(model='llama3')
+    #return llm.get_num_tokens
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    return tokenizer
 
 def adjust_lightness_hsv(color, amount=0.5):
     try:
@@ -76,6 +80,22 @@ def main(args=None):
         n_times = int(n_times)
         #print(line, "appears", n_times, "times")
         paraphrase = f"## {line} ##"
+        tokens = [tokenizer.decode(_) for _ in tokenizer.encode_plus(paraphrase)['input_ids']]
+        if tokens[3] != "00":
+            continue
+        psubstr = ""
+        substr = ""
+        for idx, tok in enumerate(tokens):
+            substr += tok
+            if idx+1 in substrings_with_n_tokens:
+                if substr in substrings_with_n_tokens[idx+1]:
+                    substrings_with_n_tokens[idx+1][substr][0] += n_times
+                else:
+                    substrings_with_n_tokens[idx+1][substr] = [n_times, psubstr]
+            else:
+                substrings_with_n_tokens[idx+1] = {substr: [n_times, psubstr]}
+            psubstr = substr
+        """
         last_n_tokens = 0
         last_ext = 0
         pprev = None
@@ -105,6 +125,7 @@ def main(args=None):
                     substrings_with_n_tokens[n_tokens][subset] = [n_times, pprev]
             else:
                 substrings_with_n_tokens[n_tokens] = {subset: [n_times, pprev]}
+        """
     pprint.pprint(substrings_with_n_tokens)
 
     # Largest width that needs processing determines center height
@@ -123,7 +144,7 @@ def main(args=None):
         prev_substrs = np.asarray([v[1] for v in substrs_freq.values()])
         untrimmed_substrs = np.asarray(list(substrs_freq.keys()))
         trimmed_substrs = np.asarray([f"{k[len(v[1]):]} ({v[0]})" for (k,v) in substrs_freq.items()])
-        #trimmed_substrs = np.asarray([k[len(v[1]):] for (k,v) in substrs_freq.items()])
+        raw_trimmed_substrs = np.asarray([k[len(v[1]):] for (k,v) in substrs_freq.items()])
 
         # Determine sorting order:
         # - Strings that share a common substring should be sorted together based on that substring
@@ -141,7 +162,12 @@ def main(args=None):
         elif len(trimmed_substrs) == 1:
             colors = ['k'] * len(prev_substrs)
         else:
-            colors = [None] * len(prev_substrs)
+            if args.special_branching_colors:
+                colorbranches = {'001': 'orange', '002': 'red', '000': 'green', '0010': 'olive'}
+                mcolorbranches = dict((k,mcolors.TABLEAU_COLORS[f'tab:{v}']) for (k,v) in colorbranches.items())
+                colors = [mcolorbranches[k] if k in mcolorbranches else None for k in raw_trimmed_substrs]
+            else:
+                colors = [None] * len(prev_substrs)
         colors = np.asarray(colors)
         for key in np.asarray(list(prev_ys.keys()))[prev_sort]:
             #print(f"Sorting key {key}")
@@ -187,7 +213,7 @@ def main(args=None):
                 tcolor = mcolors.to_hex(origin_colors[np.argmin(np.abs(origin_colors - mcolors.to_rgb(line_segment[0].get_color())).sum(axis=1)),:])
             text = ax.text(xx,yy,tt,ha='center',va='center',zorder=10, color=tcolor)
             text.set_bbox({'facecolor':'lightgray','alpha':0.8,'edgecolor':'none'})
-        prev_ys = dict((k,v) for (k,v) in zip(untrimmed_substrs,ys)) 
+        prev_ys = dict((k,v) for (k,v) in zip(untrimmed_substrs,ys))
     if args.title is None:
         ax.set_title(",".join(args.files))
     else:

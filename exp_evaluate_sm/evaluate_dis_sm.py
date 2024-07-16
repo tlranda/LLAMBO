@@ -50,12 +50,12 @@ def obtain_n_configurations(hp_constraints, n, dataset, model, task_metric, task
                 config[hp_name] = trial.suggest_float(hp_name, hp_info[2][0], hp_info[2][1], log=use_log)
             else:
                 raise ValueError(f'Unknown hyperparameter type: {hp_info[0]}')
-            
+
         model_ = get_bayesmark_func(model, task_type)
 
         train_x = dataset['train_x']
         test_x = dataset['test_x']
-        
+
         if task_type == 'regression':
             # standardize y
             y_mean = dataset['train_y'].mean()
@@ -71,7 +71,7 @@ def obtain_n_configurations(hp_constraints, n, dataset, model, task_metric, task
         scorer = get_scorer(task_metric)
         score = scorer(predictor, test_x, test_y)
         return score
-    
+
     configs = []
     scores = []
     for i in range(5):
@@ -87,21 +87,19 @@ def obtain_n_configurations(hp_constraints, n, dataset, model, task_metric, task
             else:
                 scores.append(trial.value)
 
-
     configs = pd.DataFrame(configs)
     scores = pd.DataFrame(scores, columns=['score'])
 
     return configs, scores
 
-
-def sample_n_configurations(configs, scores, n, seed, existing_config=None):
+def sample_n_configurations(configs, scores, n, seed, existing_config=None, as_quantiles=False):
     '''Sample n configurations from configs and scores'''
     number_sampled = 0
     iter_i = 0
 
     sampled_configs = pd.DataFrame()
     sampled_scores = pd.DataFrame()
-    
+
     # get all unique values in scores
     unique_scores = scores['score'].unique()
     np.random.seed(seed)
@@ -125,7 +123,7 @@ def sample_n_configurations(configs, scores, n, seed, existing_config=None):
                 row = sampled_configs.iloc[i, :]
                 if (existing_config == row).all(1).any():
                     drop_index.append(i)
-            
+
             sampled_configs = sampled_configs.drop(drop_index)
             sampled_scores = sampled_scores.drop(drop_index)
             sampled_configs = sampled_configs.reset_index(drop=True)
@@ -141,39 +139,52 @@ def sample_n_configurations(configs, scores, n, seed, existing_config=None):
         iter_i += 1
         number_sampled = len(sampled_configs)
 
-    sampled_configs = sampled_configs.head(n)
-    sampled_scores = sampled_scores.head(n)
+    # If we're doing quantile sampling, we only diverge here
+    if as_quantiles:
+        quantiles = np.array([(1+_)/n for _ in range(n)])
+        # Pick quantile values
+        qvs = sampled_scores.quantile(quantiles).values.ravel()
+        # Convert back to indices
+        qids = np.array([sampled_scores.sub(q).abs().idxmin()[0] for q in qvs])
+        # Ensure order is randomized for LLM
+        qids_order = list(range(n))
+        np.random.shuffle(qids_order)
+        # Fetch configs
+        sampled_configs = sampled_configs.loc[qids[qids_order]].reset_index(drop=True)
+        sampled_scores = pd.DataFrame({'score': quantiles[qids_order]})
+    else:
+        sampled_configs = sampled_configs.head(n)
+        sampled_scores = sampled_scores.head(n)
 
     return sampled_configs, sampled_scores
 
-
-def evaluate_posterior(fval_pred, fval_pred_std, fval_true, 
+def evaluate_posterior(fval_pred, fval_pred_std, fval_true,
                        f_best, lower_is_better):
     '''Calculate RMSE, NLL, MACE, regret to evaluate posterior prediction and uncertainty'''
     assert type(fval_pred) == type(fval_pred_std) == type(fval_true) == np.ndarray
-    
+
     if fval_pred.shape != 1:
         fval_pred = fval_pred.squeeze()
     if fval_pred_std.shape != 1:
         fval_pred_std = fval_pred_std.squeeze()
     if fval_true.shape != 1:
         fval_true = fval_true.squeeze()
-        
+
     assert len(fval_pred.shape) == 1 and len(fval_pred_std.shape) == 1 and len(fval_true.shape) == 1
-    
+
     # calculate normalized RMSE
     rmse = mean_squared_error(fval_true, fval_pred, squared=False)
     rmse /= np.abs(fval_true.max() - fval_true.min())
 
     # calculate r^2
     r2 = r2_score(fval_true, fval_pred)
-    
+
     # calculate log predictive density - catch explosive values
     fval_pred_std[fval_pred_std < 1e-12] = 1e-12
     nll = 0.5 * np.log(2 * np.pi * fval_pred_std**2) + 0.5 * ((fval_true - fval_pred) / fval_pred_std)**2
     # nll = np.mean(nll[nll<10])
     nll = np.mean(nll[nll<100])
-    
+
     # calculate empirical coverage
     alpha = 0.68 # for 1 sigma
     z = np.abs(np.percentile(np.random.randn(1000000), (1-alpha)*100/2))
@@ -187,7 +198,7 @@ def evaluate_posterior(fval_pred, fval_pred_std, fval_true,
 
     # calculate sharpness
     sharpness = cal.sharpness(fval_pred_std)
-    
+
     # compute expected improvement (EI)
     if lower_is_better:
         delta = -1*(fval_pred - f_best)
@@ -206,10 +217,8 @@ def evaluate_posterior(fval_pred, fval_pred_std, fval_true,
 
     regret /= np.abs( max(fval_true.max(), observed_fvals.max().item()) -
                      min(fval_true.min(), observed_fvals.min().item()))
-                     
+
     return rmse, r2, nll, mace, sharpness, observed_coverage, regret
-
-
 
 TASK_MAP = {
     'breast': ['classification', 'accuracy'],
@@ -218,17 +227,25 @@ TASK_MAP = {
     'iris': ['classification', 'accuracy'],
     'diabetes': ['regression', 'neg_mean_squared_error'],
     'syr2k': ['regression', 'neg_mean_squared_error'],
+    'syr2k_q': ['quantile-prediction', 'quantile'],
 }
 
-
 if __name__ == '__main__':
+    # load hyperparameter config space
+    with open(f'hp_configurations/bayesmark.json', 'r') as f:
+        hp_constraints = json.load(f)
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str)
-    parser.add_argument('--dataset', type=str)
-    parser.add_argument('--num_observed', type=int)
-    parser.add_argument('--num_seeds', type=int)
-    parser.add_argument('--engine', type=str)
-    parser.add_argument('--evaluate', nargs='+', required=True, default=None, choices=['GP','SMAC','LLAMBO','LLAMBO_VANILLA'])
+    # Extensions:
+    # * DatasetIdentity:syr2k (tuning options for syr2k)
+    parser.add_argument('--model', type=str, choices=list(hp_constraints.keys()), help="Tunable parameters the LLM is asked to reason about")
+    # Extensions:
+    # * syr2k (syr2k data with actual objective data)
+    # * syr2k_q (syr2k data but with quantiles as objectives instead of actual objective)
+    parser.add_argument('--dataset', type=str, choices=list(TASK_MAP.keys()), help="Data from interacting with the model")
+    parser.add_argument('--num_observed', type=int, help="Number of ICL examples for the LLM")
+    parser.add_argument('--num_seeds', type=int, help="Number of LLM seeds to try")
+    parser.add_argument('--engine', type=str, help="LLM model to use for inference")
+    parser.add_argument('--evaluate', nargs='+', required=True, default=None, choices=['GP','SMAC','LLAMBO','LLAMBO_VANILLA'], help="Techniques to use during evaluation")
 
     args = parser.parse_args()
     model = args.model
@@ -238,16 +255,10 @@ if __name__ == '__main__':
     engine = args.engine
     to_evaluate = args.evaluate
 
-    # load hyperparameter config space
-    with open(f'hp_configurations/bayesmark.json', 'r') as f:
-        hp_constraints = json.load(f)[model]
-
+    hp_constraints = hp_constraints[model]
     task_map = TASK_MAP[dataset]
     task_type = task_map[0]
-    task_metric = task_map[1]
-
-
-    # define result save directory
+    task_metric = task_map[1] # define result save directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     save_res_fpath = f'{script_dir}/results/evaluate_dis_sm/{dataset}/{model}/{num_observed}.json'
     if not os.path.exists(os.path.dirname(save_res_fpath)):
@@ -265,7 +276,7 @@ if __name__ == '__main__':
     # load dataset
     pickle_fpath = f'bayesmark/data/{dataset}.pickle'
     with open(pickle_fpath, 'rb') as f:
-        dataset = pickle.load(f)
+        dataset_loaded = pickle.load(f)
 
     results = {}
     for evaluator in to_evaluate:
@@ -277,9 +288,9 @@ if __name__ == '__main__':
 
     logger.info(f'Collecting configurations - this might take a while...')
     if model.startswith('DatasetIdentity:'):
-        sampled_configs, sampled_scores = load_precomputed_samples(hp_constraints, 100, dataset, model, dataset)
+        sampled_configs, sampled_scores = load_precomputed_samples(hp_constraints, 100, dataset_loaded, model, dataset_loaded)
     else:
-        sampled_configs, sampled_scores = obtain_n_configurations(hp_constraints, 100, dataset, model,
+        sampled_configs, sampled_scores = obtain_n_configurations(hp_constraints, 100, dataset_loaded, model,
                                                                   task_metric=task_metric, task_type=task_type, lower_is_better=lower_is_better)
 
     tot_llm_cost = 0
@@ -287,8 +298,8 @@ if __name__ == '__main__':
         logger.info('='*200)
         logger.info(f'Evaluating SM with seed {seed}...')
 
-        observed_configs, observed_fvals = sample_n_configurations(sampled_configs, sampled_scores, num_observed, seed=seed)
-        candidate_configs, candidate_fvals = sample_n_configurations(sampled_configs, sampled_scores, 10, seed=42)
+        observed_configs, observed_fvals = sample_n_configurations(sampled_configs, sampled_scores, num_observed, seed=seed, as_quantiles=dataset.endswith('_q'))
+        candidate_configs, candidate_fvals = sample_n_configurations(sampled_configs, sampled_scores, 10, seed=42, as_quantiles=dataset.endswith('_q'))
         f_best = observed_fvals.min().item() if lower_is_better else observed_fvals.max().item()
 
         # evaluate GP
@@ -327,17 +338,16 @@ if __name__ == '__main__':
             results['SMAC']['y_std'].append(y_std.squeeze().tolist())
             results['SMAC']['y_true'].append(candidate_fvals.to_numpy().squeeze().tolist())
 
-
         # prepare task context for LLAMBO-family of evaluators
         task_context = {}
         task_context['model'] = model
         task_context['task'] = task_type
-        task_context['tot_feats'] = dataset['train_x'].shape[1]
+        task_context['tot_feats'] = dataset_loaded['train_x'].shape[1]
         task_context['cat_feats'] = 0
-        task_context['num_feats'] = dataset['train_x'].shape[1]
-        task_context['n_classes'] = len(np.unique(dataset['train_y']))
+        task_context['num_feats'] = dataset_loaded['train_x'].shape[1]
+        task_context['n_classes'] = len(np.unique(dataset_loaded['train_y']))
         task_context['metric'] = 'mean squared error' if task_metric == 'neg_mean_squared_error' else task_metric
-        task_context['num_samples'] = dataset['train_x'].shape[0]
+        task_context['num_samples'] = dataset_loaded['train_x'].shape[0]
         task_context['hyperparameter_constraints'] = hp_constraints
 
         # evaluate LLAMBO - calibrated
@@ -363,7 +373,6 @@ if __name__ == '__main__':
             results['LLAMBO']['llm_query_cost'].append(cost)
             results['LLAMBO']['llm_query_time'].append(time_taken)
             tot_llm_cost += cost
-
 
         # evaluate LLAMBO - vanilla
         if "LLAMBO_VANILLA" in to_evaluate:

@@ -9,7 +9,6 @@ from aiohttp import ClientSession
 from llambo.rate_limiter import RateLimiter
 from llambo.discriminative_sm_utils import gen_prompt_tempates
 
-
 openai.api_type = os.environ["OPENAI_API_TYPE"]
 openai.api_version = os.environ["OPENAI_API_VERSION"]
 openai.api_base = os.environ["OPENAI_API_BASE"]
@@ -17,11 +16,12 @@ openai.api_key = os.environ["OPENAI_API_KEY"]
 
 
 class LLM_DIS_SM:
-    def __init__(self, task_context, n_gens, lower_is_better, 
-                 bootstrapping=False, n_templates=1, 
+    ollama_engines = ['llama3','phi3']
+    def __init__(self, task_context, n_gens, lower_is_better,
+                 bootstrapping=False, n_templates=1,
                  use_recalibration=False,
                  rate_limiter=None, warping_transformer=None,
-                 verbose=False, chat_engine=None, 
+                 verbose=False, chat_engine=None,
                  prompt_setting=None, shuffle_features=False):
         '''Initialize the forward LLM surrogate model. This is modelling p(y|x) as in GP/SMAC etc.'''
         self.task_context = task_context
@@ -29,7 +29,7 @@ class LLM_DIS_SM:
         self.lower_is_better = lower_is_better
         self.bootstrapping = bootstrapping
         self.n_templates = n_templates
-        assert not (bootstrapping and use_recalibration), 'Cannot do recalibration and boostrapping at the same time' 
+        assert not (bootstrapping and use_recalibration), 'Cannot do recalibration and boostrapping at the same time'
         self.use_recalibration = use_recalibration
         if rate_limiter is None:
             self.rate_limiter = RateLimiter(max_tokens=100000, time_frame=60)
@@ -75,7 +75,7 @@ class LLM_DIS_SM:
                                      'max_tokens': 8,
                                      'request_timeout': None, # Formerly 10
                                     }
-                    if self.chat_engine == 'llama3':
+                    if self.chat_engine in self.ollama_engines:
                         # Ollama needs this to be the MODEL argument
                         openai_kwargs.update({'model': self.chat_engine})
                     else:
@@ -87,7 +87,7 @@ class LLM_DIS_SM:
                     self.rate_limiter.add_request(request_token_count=resp['usage']['total_tokens'], current_time=time.time())
                     # Using Ollama, call multiple times for n_generations
                     other_resps = []
-                    if self.chat_engine == 'llama3':
+                    if self.chat_engine in self.ollama_engines:
                         for i in range(n_generations-1):
                             self.rate_limiter.add_request(request_text=user_message, current_time=time.time())
                             # Ensure seeds change so you don't always get the exact same response
@@ -151,7 +151,7 @@ class LLM_DIS_SM:
 
         return results  # format [(resp, tot_cost, tot_tokens), None, (resp, tot_cost, tot_tokens)]
 
-    
+
     async def _predict(self, all_prompt_templates, query_examples):
         start = time.time()
         all_preds = []
@@ -211,8 +211,8 @@ class LLM_DIS_SM:
         y_std[y_std<1e-5] = 1e-5  # replace small values to avoid division by zero
 
         return y_mean, y_std, success_rate, tot_cost, tot_tokens, time_taken
-    
-    async def _evaluate_candidate_points(self, observed_configs, observed_fvals, candidate_configs, 
+
+    async def _evaluate_candidate_points(self, observed_configs, observed_fvals, candidate_configs,
                                          use_context='full_context', use_feature_semantics=True, return_ei=False):
         '''Evaluate candidate points using the LLM model.'''
 
@@ -236,9 +236,9 @@ class LLM_DIS_SM:
         all_run_cost += tot_cost
         all_run_time += time_taken
 
-        all_prompt_templates, query_examples = gen_prompt_tempates(self.task_context, observed_configs, observed_fvals, candidate_configs, 
+        all_prompt_templates, query_examples = gen_prompt_tempates(self.task_context, observed_configs, observed_fvals, candidate_configs,
                                                                     n_prompts=self.n_templates, bootstrapping=self.bootstrapping,
-                                                                    use_context=use_context, use_feature_semantics=use_feature_semantics, 
+                                                                    use_context=use_context, use_feature_semantics=use_feature_semantics,
                                                                     shuffle_features=self.shuffle_features, apply_warping=self.apply_warping)
 
         print('*'*100)
@@ -259,7 +259,7 @@ class LLM_DIS_SM:
 
         if not return_ei:
             return y_mean, y_std, all_run_cost, all_run_time
-    
+
         else:
             # calcualte ei
             if self.lower_is_better:
@@ -304,6 +304,4 @@ class LLM_DIS_SM:
         best_point = candidate_configs.iloc[[best_point_index], :]  # return selected point as dataframe not series
 
         return best_point, cost, time_taken
-
-
 

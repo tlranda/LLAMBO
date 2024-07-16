@@ -155,7 +155,7 @@ Performance: {A}"""
         if use_context == 'full_context':
             if task == 'classification':
                 prefix += f" The model is evaluated on a tabular {task} task and the label contains {n_classes} classes."
-            elif task == 'regression':
+            elif task == 'regression' or task == 'quantile-prediction':
                 prefix += f" The model is evaluated on a tabular {task} task."
             else:
                 raise Exception
