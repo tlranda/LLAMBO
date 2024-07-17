@@ -14,7 +14,6 @@ openai.api_version = os.environ["OPENAI_API_VERSION"]
 openai.api_base = os.environ["OPENAI_API_BASE"]
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
-
 class LLM_DIS_SM:
     ollama_engines = ['llama3','phi3']
     def __init__(self, task_context, n_gens, lower_is_better,
@@ -22,7 +21,8 @@ class LLM_DIS_SM:
                  use_recalibration=False,
                  rate_limiter=None, warping_transformer=None,
                  verbose=False, chat_engine=None,
-                 prompt_setting=None, shuffle_features=False):
+                 prompt_setting=None, shuffle_features=False,
+                 logger=None):
         '''Initialize the forward LLM surrogate model. This is modelling p(y|x) as in GP/SMAC etc.'''
         self.task_context = task_context
         self.n_gens = n_gens
@@ -31,6 +31,10 @@ class LLM_DIS_SM:
         self.n_templates = n_templates
         assert not (bootstrapping and use_recalibration), 'Cannot do recalibration and boostrapping at the same time'
         self.use_recalibration = use_recalibration
+        if logger is None:
+            import logging
+            logger = logging.getLogger(__name__)
+        self.logger = logger
         if rate_limiter is None:
             self.rate_limiter = RateLimiter(max_tokens=100000, time_frame=60)
         else:
@@ -111,8 +115,10 @@ class LLM_DIS_SM:
                         resp.choices.extend(choices)
                     break
                 except Exception as e:
+                    self.logger.info(f'LLM generation attempt {retry+1}/{MAX_RETRIES} failed:'+str(e))
                     print(f'[SM] RETRYING LLM REQUEST {retry+1}/{MAX_RETRIES}...')
                     print(resp)
+                    print(e)
                     if retry == MAX_RETRIES-1:
                         await openai.aiosession.get().close()
                         raise e
@@ -128,29 +134,33 @@ class LLM_DIS_SM:
 
         return query_idx, resp, tot_cost, tot_tokens
 
-
-
     async def _generate_concurrently(self, few_shot_templates, query_examples):
         '''Perform concurrent generation of responses from the LLM async.'''
-
         coroutines = []
         for template in few_shot_templates:
             for query_idx, query_example in enumerate(query_examples):
                 coroutines.append(self._async_generate(template, query_example, query_idx))
 
+        results = [[] for _ in range(len(query_examples))] # nested list
+        # My machine cannot locally generate all of these at once, so rewrite this to be one-at-a-time please
+        for c in coroutines:
+            task = asyncio.create_task(c)
+            llm_response = await asyncio.gather(task)
+            for response in llm_response:
+                if response is not None:
+                    query_idx, resp, tot_cost, tot_tokens = response
+                    results[query_idx].append([resp, tot_cost, tot_tokens])
+        # Old version that would generate all templates in parallel
+        """
         tasks = [asyncio.create_task(c) for c in coroutines]
-
-        results = [[] for _ in range(len(query_examples))]      # nested list
-
         llm_response = await asyncio.gather(*tasks)
 
         for response in llm_response:
             if response is not None:
                 query_idx, resp, tot_cost, tot_tokens = response
                 results[query_idx].append([resp, tot_cost, tot_tokens])
-
+        """
         return results  # format [(resp, tot_cost, tot_tokens), None, (resp, tot_cost, tot_tokens)]
-
 
     async def _predict(self, all_prompt_templates, query_examples):
         start = time.time()
@@ -166,6 +176,8 @@ class LLM_DIS_SM:
         i = 0
         while i < len(query_examples):
             query_chunk = query_examples[i:i+n_concurrent]
+            self.logger.info(f"Query: {query_chunk}")
+            print(f"Query: {query_chunk}")
             chunk_results = await self._generate_concurrently(all_prompt_templates, query_chunk)
             bool_pred_returned.extend([1 if x is not None else 0 for x in chunk_results])                # track effective number of predictions returned
             for _, sample_response in enumerate(chunk_results):
@@ -174,7 +186,7 @@ class LLM_DIS_SM:
                 else:
                     sample_preds = []
                     all_gens_text = [x['message']['content'] for template_response in sample_response for x in template_response[0]['choices'] ]        # fuarr this is some high level programming
-                    print(f"Query: {query_chunk}")
+                    self.logger.info(f"Response: {all_gens_text}")
                     print(f"Response: {all_gens_text}")
                     for gen_text in all_gens_text:
                         gen_pred = re.findall(r"## (-?[\d.]+) ##", gen_text)
@@ -241,6 +253,10 @@ class LLM_DIS_SM:
                                                                     use_context=use_context, use_feature_semantics=use_feature_semantics,
                                                                     shuffle_features=self.shuffle_features, apply_warping=self.apply_warping)
 
+        self.logger.info('*'*100)
+        self.logger.info(f"Number of all_prompt_templates: {len(all_prompt_templates)}")
+        self.logger.info(f'Number of query_examples: {len(query_examples)}')
+        self.logger.info(all_prompt_templates[0].format(Q=query_examples[0]['Q']))
         print('*'*100)
         print(f'Number of all_prompt_templates: {len(all_prompt_templates)}')
         print(f'Number of query_examples: {len(query_examples)}')

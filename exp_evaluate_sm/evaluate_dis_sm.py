@@ -292,6 +292,10 @@ if __name__ == '__main__':
     else:
         sampled_configs, sampled_scores = obtain_n_configurations(hp_constraints, 100, dataset_loaded, model,
                                                                   task_metric=task_metric, task_type=task_type, lower_is_better=lower_is_better)
+    logger.info("Sampled Configurations")
+    logger.info(sampled_configs)
+    logger.info("Sampled Scores")
+    logger.info(sampled_scores)
 
     tot_llm_cost = 0
     for seed in range(num_seeds):
@@ -299,7 +303,17 @@ if __name__ == '__main__':
         logger.info(f'Evaluating SM with seed {seed}...')
 
         observed_configs, observed_fvals = sample_n_configurations(sampled_configs, sampled_scores, num_observed, seed=seed, as_quantiles=dataset.endswith('_q'))
+        logger.info("Observed_configs (ICL)")
+        logger.info(observed_configs)
+        logger.info("Observed_fvals (ICL)")
+        logger.info(observed_fvals)
+        logger.info('.'*50)
         candidate_configs, candidate_fvals = sample_n_configurations(sampled_configs, sampled_scores, 10, seed=42, as_quantiles=dataset.endswith('_q'))
+        logger.info("Prompt configs to solve via LLM")
+        logger.info(candidate_configs)
+        logger.info("Ground truth for prompt configs")
+        logger.info(candidate_fvals)
+        logger.info('.'*50)
         f_best = observed_fvals.min().item() if lower_is_better else observed_fvals.max().item()
 
         # evaluate GP
@@ -354,7 +368,7 @@ if __name__ == '__main__':
         if "LLAMBO" in to_evaluate:
             LLM_SM = LLM_DIS_SM(task_context, n_gens=10, lower_is_better=lower_is_better,
                                     bootstrapping=False, n_templates=5, use_recalibration=False,
-                                    verbose=False, rate_limiter=rate_limiter, chat_engine=engine)
+                                    verbose=False, rate_limiter=rate_limiter, chat_engine=engine, logger=logger)
             y_mean, y_std, cost, time_taken = asyncio.run(LLM_SM._evaluate_candidate_points(observed_configs, observed_fvals, candidate_configs))
             scores = evaluate_posterior(y_mean, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
             rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
@@ -378,7 +392,7 @@ if __name__ == '__main__':
         if "LLAMBO_VANILLA" in to_evaluate:
             LLM_SM = LLM_DIS_SM(task_context, n_gens=10, lower_is_better=lower_is_better,
                                     bootstrapping=False, n_templates=1, use_recalibration=False,
-                                    verbose=False, rate_limiter=rate_limiter, chat_engine=engine)
+                                    verbose=False, rate_limiter=rate_limiter, chat_engine=engine, logger=logger)
             y_mean, y_std, cost, time_taken = asyncio.run(LLM_SM._evaluate_candidate_points(observed_configs, observed_fvals, candidate_configs))
             scores = evaluate_posterior(y_mean, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
             rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
