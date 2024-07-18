@@ -32,6 +32,7 @@ def setup_logging(log_name):
 
 def load_precomputed_samples(hp_constraints, n, dataset_name, model, dataset):
     # For purposes here, the train/test split does not matter, re-unify them
+    # Ignore the n-value for now, we may revisit that later
     all_x = np.vstack((dataset['train_x'], dataset['test_x']))
     all_y = np.hstack((dataset['train_y'], dataset['test_y']))
     sampled_configs = pd.DataFrame(all_x, columns=list(hp_constraints.keys()))

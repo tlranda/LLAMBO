@@ -144,7 +144,7 @@ def gen_prompt_tempates(
         example_template = """
 Hyperparameter configuration: {Q}
 Performance: {A}"""
-        
+
         example_prompt = PromptTemplate(
             input_variables=["Q", "A"],
             template=example_template
