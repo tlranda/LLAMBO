@@ -92,10 +92,13 @@ def obtain_n_configurations(hp_constraints, n, dataset, model, task_metric, task
 
     return configs, scores
 
-def sample_n_configurations(configs, scores, n, seed, existing_config=None, as_quantiles=False):
+def sample_n_configurations(configs, scores, n, seed, existing_config=None, local_quantiles=False):
     '''Sample n configurations from configs and scores'''
     number_sampled = 0
     iter_i = 0
+
+    if local_quantiles:
+        score_quantiles = scores[['score']].rank(method='max').apply(lambda x: (x-1)/(len(scores)-1))
 
     sampled_configs = pd.DataFrame()
     sampled_scores = pd.DataFrame()
@@ -109,11 +112,20 @@ def sample_n_configurations(configs, scores, n, seed, existing_config=None, as_q
 
     # avoid execessive duplication of configs - makes prediction task trivial!
     while number_sampled < n:
-        # randomly sample from each unique score
-        sample_index = scores.groupby('score_rank').apply(lambda x: x.sample(1, random_state=seed+iter_i)).index.get_level_values(1)
+        if local_quantiles:
+            # randomly sample from uniform quantiles, but account for loop iteration in case existing_config denies certain values
+            sample_index = np.array([np.floor(len(scores)*(_/n)) for _ in range(n)], dtype=int) + iter_i
+            # If things get dropped due to existing_config, you may see less-uniform overall distribution, so shuffle the indices as a counteract
+            np.random.shuffle(sample_index)
+        else:
+            # randomly sample from each unique score
+            sample_index = scores.groupby('score_rank').apply(lambda x: x.sample(1, random_state=seed+iter_i)).index.get_level_values(1)
         # get sampled configs and scores
         sampled_configs = pd.concat([sampled_configs, configs.iloc[sample_index]], axis=0)
-        sampled_scores = pd.concat([sampled_scores, scores[['score']].iloc[sample_index]], axis=0)
+        if local_quantiles:
+            sampled_scores = pd.concat([sampled_scores, score_quantiles.iloc[sample_index]], axis=0)
+        else:
+            sampled_scores = pd.concat([sampled_scores, scores[['score']].iloc[sample_index]], axis=0)
         sampled_configs = sampled_configs.reset_index(drop=True)
         sampled_scores = sampled_scores.reset_index(drop=True)
 
@@ -139,22 +151,8 @@ def sample_n_configurations(configs, scores, n, seed, existing_config=None, as_q
         iter_i += 1
         number_sampled = len(sampled_configs)
 
-    # If we're doing quantile sampling, we only diverge here
-    if as_quantiles:
-        quantiles = np.array([(1+_)/n for _ in range(n)])
-        # Pick quantile values
-        qvs = sampled_scores.quantile(quantiles).values.ravel()
-        # Convert back to indices
-        qids = np.array([sampled_scores.sub(q).abs().idxmin()[0] for q in qvs])
-        # Ensure order is randomized for LLM
-        qids_order = list(range(n))
-        np.random.shuffle(qids_order)
-        # Fetch configs
-        sampled_configs = sampled_configs.loc[qids[qids_order]].reset_index(drop=True)
-        sampled_scores = pd.DataFrame({'score': quantiles[qids_order]})
-    else:
-        sampled_configs = sampled_configs.head(n)
-        sampled_scores = sampled_scores.head(n)
+    sampled_configs = sampled_configs.head(n)
+    sampled_scores = sampled_scores.head(n)
 
     return sampled_configs, sampled_scores
 
@@ -170,7 +168,7 @@ def evaluate_posterior(fval_pred, fval_pred_std, fval_true,
     if fval_true.shape != 1:
         fval_true = fval_true.squeeze()
 
-    assert len(fval_pred.shape) == 1 and len(fval_pred_std.shape) == 1 and len(fval_true.shape) == 1
+    assert len(fval_pred.shape) == 1 and len(fval_pred_std.shape) == 1 and len(fval_true.shape) == 1, f"{len(fval_pred.shape)} == 1 | {len(fval_pred_std.shape)} == 1 | {len(fval_true.shape)} == 1"
 
     # calculate normalized RMSE
     rmse = mean_squared_error(fval_true, fval_pred, squared=False)
@@ -243,14 +241,16 @@ if __name__ == '__main__':
     # * syr2k_q (syr2k data but with quantiles as objectives instead of actual objective)
     parser.add_argument('--dataset', type=str, choices=list(TASK_MAP.keys()), help="Data from interacting with the model")
     parser.add_argument('--num_observed', type=int, help="Number of ICL examples for the LLM")
-    parser.add_argument('--num_seeds', type=int, help="Number of LLM seeds to try")
-    parser.add_argument('--engine', type=str, help="LLM model to use for inference")
+    parser.add_argument('--num_seeds', type=int, default=1, help="Number of LLM seeds to try (default: %(default)s)")
+    parser.add_argument('--num_candidates', type=int, default=10, help="Number of candidates for LLM to try (default: %(default)s)")
+    parser.add_argument('--engine', type=str, default='llama3', help="LLM model to use for inference (default: %(default)s)")
     parser.add_argument('--evaluate', nargs='+', required=True, default=None, choices=['GP','SMAC','LLAMBO','LLAMBO_VANILLA'], help="Techniques to use during evaluation")
 
     args = parser.parse_args()
     model = args.model
     dataset = args.dataset
     num_observed = args.num_observed
+    num_candidates = args.num_candidates
     num_seeds = args.num_seeds
     engine = args.engine
     to_evaluate = args.evaluate
@@ -302,13 +302,14 @@ if __name__ == '__main__':
         logger.info('='*200)
         logger.info(f'Evaluating SM with seed {seed}...')
 
-        observed_configs, observed_fvals = sample_n_configurations(sampled_configs, sampled_scores, num_observed, seed=seed, as_quantiles=dataset.endswith('_q'))
+        observed_configs, observed_fvals = sample_n_configurations(sampled_configs, sampled_scores, num_observed, seed=seed, local_quantiles=dataset.endswith('_q'))
         logger.info("Observed_configs (ICL)")
         logger.info(observed_configs)
         logger.info("Observed_fvals (ICL)")
         logger.info(observed_fvals)
         logger.info('.'*50)
-        candidate_configs, candidate_fvals = sample_n_configurations(sampled_configs, sampled_scores, 10, seed=42, as_quantiles=dataset.endswith('_q'))
+        # LLAMBO authors forgot to pass in the existing config argument to prevent LLM from being evaluated against ICL data
+        candidate_configs, candidate_fvals = sample_n_configurations(sampled_configs, sampled_scores, num_candidates, seed=42, existing_config=observed_configs, local_quantiles=dataset.endswith('_q'))
         logger.info("Prompt configs to solve via LLM")
         logger.info(candidate_configs)
         logger.info("Ground truth for prompt configs")
