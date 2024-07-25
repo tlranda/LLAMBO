@@ -15,7 +15,7 @@ openai.api_base = os.environ["OPENAI_API_BASE"]
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
 class LLM_DIS_SM:
-    ollama_engines = ['llama3','phi3']
+    ollama_engines = ['llama3','llama3.1','phi3']
     def __init__(self, task_context, n_gens, lower_is_better,
                  bootstrapping=False, n_templates=1,
                  use_recalibration=False,
