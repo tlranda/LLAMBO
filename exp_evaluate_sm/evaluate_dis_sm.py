@@ -251,6 +251,7 @@ if __name__ == '__main__':
     # Extensions:
     # * syr2k (syr2k data with actual objective data)
     # * syr2k_q (syr2k data but with quantiles as objectives instead of actual objective)
+    # * syr2k_r (syr2k data but with ranks as objectives instead of actual objective)
     parser.add_argument('--dataset', type=str, choices=list(TASK_MAP.keys()), help="Data from interacting with the model")
     parser.add_argument('--num_observed', type=int, help="Number of ICL examples for the LLM")
     parser.add_argument('--num_seeds', type=int, default=1, help="Number of LLM seeds to try (default: %(default)s)")
@@ -270,7 +271,8 @@ if __name__ == '__main__':
     hp_constraints = hp_constraints[model]
     task_map = TASK_MAP[dataset]
     task_type = task_map[0]
-    task_metric = task_map[1] # define result save directory
+    task_metric = task_map[1]
+    # define result save directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     save_res_fpath = f'{script_dir}/results/evaluate_dis_sm/{dataset}/{model}/{num_observed}.json'
     if not os.path.exists(os.path.dirname(save_res_fpath)):

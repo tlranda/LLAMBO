@@ -178,6 +178,7 @@ class LLM_DIS_SM:
             query_chunk = query_examples[i:i+n_concurrent]
             query_truths = query_ground_truths[i:i+n_concurrent]
             self.logger.info(f"Query: {query_chunk}")
+            self.logger.info(f"Ground Truth: {query_truths}")
             print(f"Query: {query_chunk}")
             print(f"Ground Truth: {query_truths}")
             chunk_results = await self._generate_concurrently(all_prompt_templates, query_chunk)

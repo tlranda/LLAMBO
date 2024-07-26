@@ -1,6 +1,6 @@
 import numpy as np
-from langchain import FewShotPromptTemplate
-from langchain import PromptTemplate
+from langchain.prompts import FewShotPromptTemplate
+from langchain.prompts import PromptTemplate
 
 def _count_decimal_places(n):
     '''Count the number of decimal places in a number.'''
@@ -52,9 +52,11 @@ def prepare_configurations(
         row_string = ''
         for i in range(len(row)):
             lower_bound = hyperparameter_constraints[hyperparameter_names[i]][2]
-            n_dp = _count_decimal_places(lower_bound) + 2 # number of decimal places
-            row_string += f'{hyperparameter_names[i]}: ' + f'{row[i]:.{n_dp}f}' \
-                    if isinstance(row[i], float) and not row[i]%1 ==0 else f'{hyperparameter_names[i]}: ' + str(row[i])
+            if isinstance(row[i], float):
+                n_dp = _count_decimal_places(lower_bound) + 2 # number of decimal places
+                row_string += f'{hyperparameter_names[i]}: {row[i]:.{n_dp}f}'
+            else:
+                row_string += f'{hyperparameter_names[i]}: {row[i]}'
             if i != len(row)-1:
                 row_string += ', '
         example = {'Q': row_string}
@@ -107,7 +109,7 @@ Classification: {A}"""
         prefix = f"The following are examples of hyperparameter configurations for a {model} and the corresponding performance classification."
         if task == 'classification':
             prefix += f" The model is evaluated on a tabular {task} task and the label contains {n_classes} classes."
-        elif task == 'regression':
+        elif task in ['regression', 'quantile-prediction', 'rank-prediction']:
             prefix += f" The model is evaluated on a tabular {task} task."
         else:
             raise Exception
