@@ -11,6 +11,7 @@ def build():
     prs.add_argument('--sample', type=int, default=None, help="Number of samples (total between Train AND Test) to use from dataset (default: ALL from CSV)")
     prs.add_argument('--seed', type=int, default=1234, help="RNG seed (default: %(default)s)")
     prs.add_argument('--y-column', default='objective', help="Name of column to use as y-values (default: %(default)s)")
+    prs.add_argument('--y-transform', choices=['none','rank','quantile'], default='none', help="Modification to y-column values (original values: none, rank: least-to-greatest, quantile: rank/len(data)); (default: %(default)s)")
     return prs
 
 def parse(args=None, prs=None):
@@ -23,6 +24,12 @@ def parse(args=None, prs=None):
 def main(args=None):
     args = parse(args)
     initial_data = pd.read_csv(args.csv)
+
+    # Transform y-column data as directed
+    if args.y_transform in ['rank','quantile']:
+        initial_data[args.y_column] = initial_data[args.y_column].rank(method='first').astype(int)
+        if args.y_transform == 'quantile':
+            initial_data[args.y_column] /= len(initial_data)
 
     # Get subset in a random order with seeding
     if args.sample is None:

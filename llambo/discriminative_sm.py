@@ -162,7 +162,7 @@ class LLM_DIS_SM:
         """
         return results  # format [(resp, tot_cost, tot_tokens), None, (resp, tot_cost, tot_tokens)]
 
-    async def _predict(self, all_prompt_templates, query_examples):
+    async def _predict(self, all_prompt_templates, query_examples, query_ground_truths):
         start = time.time()
         all_preds = []
         tot_tokens = 0
@@ -176,8 +176,10 @@ class LLM_DIS_SM:
         i = 0
         while i < len(query_examples):
             query_chunk = query_examples[i:i+n_concurrent]
+            query_truths = query_ground_truths[i:i+n_concurrent]
             self.logger.info(f"Query: {query_chunk}")
             print(f"Query: {query_chunk}")
+            print(f"Ground Truth: {query_truths}")
             chunk_results = await self._generate_concurrently(all_prompt_templates, query_chunk)
             bool_pred_returned.extend([1 if x is not None else 0 for x in chunk_results])                # track effective number of predictions returned
             for _, sample_response in enumerate(chunk_results):
@@ -224,7 +226,7 @@ class LLM_DIS_SM:
 
         return y_mean, y_std, success_rate, tot_cost, tot_tokens, time_taken
 
-    async def _evaluate_candidate_points(self, observed_configs, observed_fvals, candidate_configs,
+    async def _evaluate_candidate_points(self, observed_configs, observed_fvals, candidate_configs, candidate_fvals,
                                          use_context='full_context', use_feature_semantics=True, return_ei=False):
         '''Evaluate candidate points using the LLM model.'''
 
@@ -262,7 +264,7 @@ class LLM_DIS_SM:
         print(f'Number of query_examples: {len(query_examples)}')
         print(all_prompt_templates[0].format(Q=query_examples[0]['Q']))
 
-        response = await self._predict(all_prompt_templates, query_examples)
+        response = await self._predict(all_prompt_templates, query_examples, candidate_fvals)
 
         y_mean, y_std, success_rate, tot_cost, tot_tokens, time_taken = response
 

@@ -169,11 +169,21 @@ def evaluate_posterior(fval_pred, fval_pred_std, fval_true,
     if fval_true.shape != 1:
         fval_true = fval_true.squeeze()
 
+    if any(map(lambda x: len(x) != 1, [fval_pred.shape, fval_pred_std.shape, fval_true.shape])):
+        # What likely happened is you only made one request, so the shape is ()
+        if fval_pred.shape != 1:
+            fval_pred = fval_pred.ravel()
+        if fval_pred_std.shape != 1:
+            fval_pred_std = fval_pred_std.ravel()
+        if fval_true.shape != 1:
+            fval_true = fval_true.ravel()
     assert len(fval_pred.shape) == 1 and len(fval_pred_std.shape) == 1 and len(fval_true.shape) == 1, f"{len(fval_pred.shape)} == 1 | {len(fval_pred_std.shape)} == 1 | {len(fval_true.shape)} == 1"
 
     # calculate normalized RMSE
     rmse = mean_squared_error(fval_true, fval_pred, squared=False)
-    rmse /= np.abs(fval_true.max() - fval_true.min())
+    # Prevent divide-by-zero for single samples
+    if fval_true.max() != fval_true.min():
+        rmse /= np.abs(fval_true.max() - fval_true.min())
 
     # calculate r^2
     r2 = r2_score(fval_true, fval_pred)
@@ -227,6 +237,7 @@ TASK_MAP = {
     'diabetes': ['regression', 'neg_mean_squared_error'],
     'syr2k': ['regression', 'neg_mean_squared_error'],
     'syr2k_q': ['quantile-prediction', 'quantile'],
+    'syr2k_r': ['rank-prediction', 'rank out of 10648'],
 }
 
 if __name__ == '__main__':
@@ -371,7 +382,7 @@ if __name__ == '__main__':
             LLM_SM = LLM_DIS_SM(task_context, n_gens=10, lower_is_better=lower_is_better,
                                     bootstrapping=False, n_templates=5, use_recalibration=False,
                                     verbose=False, rate_limiter=rate_limiter, chat_engine=engine, logger=logger)
-            y_mean, y_std, cost, time_taken = asyncio.run(LLM_SM._evaluate_candidate_points(observed_configs, observed_fvals, candidate_configs))
+            y_mean, y_std, cost, time_taken = asyncio.run(LLM_SM._evaluate_candidate_points(observed_configs, observed_fvals, candidate_configs, candidate_fvals))
             scores = evaluate_posterior(y_mean, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
             rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
             logger.info(f"[LLAMBO] RMSE: {rmse:.4f}, R2 score: {r2:.4f}, NLL: {nll:.4f}, "
@@ -395,7 +406,7 @@ if __name__ == '__main__':
             LLM_SM = LLM_DIS_SM(task_context, n_gens=10, lower_is_better=lower_is_better,
                                     bootstrapping=False, n_templates=1, use_recalibration=False,
                                     verbose=False, rate_limiter=rate_limiter, chat_engine=engine, logger=logger)
-            y_mean, y_std, cost, time_taken = asyncio.run(LLM_SM._evaluate_candidate_points(observed_configs, observed_fvals, candidate_configs))
+            y_mean, y_std, cost, time_taken = asyncio.run(LLM_SM._evaluate_candidate_points(observed_configs, observed_fvals, candidate_configs, candidate_fvals))
             scores = evaluate_posterior(y_mean, y_std, candidate_fvals.to_numpy(), f_best, lower_is_better)
             rmse, r2, nll, mace, sharpness, observed_coverage, regret = scores
             logger.info(f"[LLAMBO_VANILLA] RMSE: {rmse:.4f}, R2 score: {r2:.4f}, NLL: {nll:.4f}, "

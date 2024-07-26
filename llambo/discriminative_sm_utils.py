@@ -98,7 +98,10 @@ def prepare_configurations(
         example = {'Q': row_string}
         if observed_fvals is not None:
             row_index = observed_fvals.index.get_loc(index)
-            perf = f'## {observed_fvals.values[row_index][0]:.6f} ##'
+            perf = observed_fvals.values[row_index][0]
+            if isinstance(perf, float):
+                perf = f"{perf:.6f}"
+            perf = f'## {perf} ##'
             example['A'] = perf
         examples.append(example)
         
@@ -150,12 +153,11 @@ Performance: {A}"""
             template=example_template
         )
 
-        prefix = ""
         prefix = f"The following are hyperparameter configurations for a {model} and the corresponding performance measured in {metric}."
         if use_context == 'full_context':
             if task == 'classification':
                 prefix += f" The model is evaluated on a tabular {task} task and the label contains {n_classes} classes."
-            elif task == 'regression' or task == 'quantile-prediction':
+            elif task in ['regression', 'quantile-prediction', 'rank-prediction']:
                 prefix += f" The model is evaluated on a tabular {task} task."
             else:
                 raise Exception
