@@ -75,9 +75,6 @@ def sample_from_GP(hp_constraints, lower_is_better, num_candidates, observed_con
 
     return candidates
 
-
-
-
 def custom_gamma(x: int) -> int:
     return min(int(np.ceil(0.3 * x)), 25)
 
@@ -130,7 +127,6 @@ def sample_from_TPESampler(hp_constraints, lower_is_better, num_candidates, mode
 
     return candidates
 
-    
 def sample_from_RandomSampler(hp_constraints, num_candidates, seed):
     '''Sample from independent Random sampler'''
     sampler = RandomSampler(seed=42+seed)
@@ -157,6 +153,4 @@ def sample_from_RandomSampler(hp_constraints, num_candidates, seed):
         candidates.append(trial.params)
 
     return candidates
-
-    
 

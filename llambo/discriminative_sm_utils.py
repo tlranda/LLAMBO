@@ -92,7 +92,6 @@ def prepare_configurations(
                 else:
                     row_string += row[i]
 
-
             if i != len(row)-1:
                 row_string += ', '
         example = {'Q': row_string}

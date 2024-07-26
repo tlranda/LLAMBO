@@ -14,5 +14,21 @@
     "diabetes": {
         "global_max": 0.8389739213304408,
         "global_min": 0.5817586934044268
+    },
+    "syr2k": {
+        "global_max": 0.007352,
+        "global_min": 0.0004395,
+        "alternative_XL": {
+            "global_max": 40.3687855,
+            "global_min": 1.0
+        }
+    },
+    "syr2k_q": {
+        "global_max": 1.0,
+        "global_min": 0.0
+    },
+    "syr2k_r": {
+        "global_max": 10648,
+        "global_min": 1
     }
 }

@@ -4,11 +4,12 @@ import math
 import time
 import openai
 import asyncio
+import re
 import numpy as np
 import pandas as pd
 from aiohttp import ClientSession
-from langchain import FewShotPromptTemplate
-from langchain import PromptTemplate
+from langchain.prompts import FewShotPromptTemplate
+from langchain.prompts import PromptTemplate
 from llambo.rate_limiter import RateLimiter
 
 openai.api_type = os.environ["OPENAI_API_TYPE"]
@@ -18,9 +19,10 @@ openai.api_key = os.environ["OPENAI_API_KEY"]
 
 
 class LLM_ACQ:
+    ollama_engines = ['llama3','llama3.1','phi3']
     def __init__(self, task_context, n_candidates, n_templates, lower_is_better, 
                  jitter=False, rate_limiter=None, warping_transformer=None, chat_engine=None, 
-                 prompt_setting=None, shuffle_features=False):
+                 prompt_setting=None, shuffle_features=False, logger=None):
         '''Initialize the LLM Acquisition function.'''
         self.task_context = task_context
         self.n_candidates = n_candidates
@@ -28,6 +30,10 @@ class LLM_ACQ:
         self.n_gens = int(n_candidates/n_templates)
         self.lower_is_better = lower_is_better
         self.apply_jitter = jitter
+        if logger is None:
+            import logging
+            logger = logging.getLogger(__name__)
+        self.logger = logger
         if rate_limiter is None:
             self.rate_limiter = RateLimiter(max_tokens=40000, time_frame=60)
         else:
@@ -44,10 +50,8 @@ class LLM_ACQ:
 
         assert type(self.shuffle_features) == bool, 'shuffle_features must be a boolean'
 
-
     def _jitter(self, desired_fval):
         '''Add jitter to observed fvals to prevent duplicates.'''
-
         if not self.apply_jitter:
             return desired_fval
 
@@ -58,9 +62,7 @@ class LLM_ACQ:
         jittered = np.random.uniform(low=min(desired_fval, self.observed_best), 
                                         high=max(desired_fval, self.observed_best), 
                                         size=1).item()
-
         return jittered
-
 
     def _count_decimal_places(self, n):
         '''Count the number of decimal places in a number.'''
@@ -119,9 +121,9 @@ class LLM_ACQ:
 
                     if hyp_type in ['int', 'float']:
                         lower_bound = self.task_context['hyperparameter_constraints'][hyperparameter_names[i]][2][0]
+                        n_dp = self._count_decimal_places(lower_bound)
                     else:
                         lower_bound = self.task_context['hyperparameter_constraints'][hyperparameter_names[i]][2][1]
-                    n_dp = self._count_decimal_places(lower_bound)
                     value = row[i]
                     if self.apply_warping:
                         if hyp_type == 'int' and hyp_transform != 'log':
@@ -132,14 +134,13 @@ class LLM_ACQ:
                             row_string += f'{value:.{n_dp}f}'
                         else:
                             row_string += value
-
                     else:
                         if hyp_type == 'int':
                             row_string += str(int(value))
                         elif hyp_type in ['float', 'ordinal']:
                             row_string += f'{value:.{n_dp}f}'
                         else:
-                            row_string += value
+                            row_string += str(value)
 
                     if i != len(row)-1:
                         row_string += ', '
@@ -147,16 +148,19 @@ class LLM_ACQ:
                 example = {'Q': row_string}
                 if observed_fvals is not None:
                     row_index = observed_fvals.index.get_loc(index)
-                    perf = f'{observed_fvals.values[row_index][0]:.6f}'
+                    perf = observed_fvals.values[row_index][0]
+                    if isinstance(perf, float):
+                        perf = f'{perf:.6f}'
                     example['A'] = perf
                 examples.append(example)
         elif observed_fvals is not None:
-            examples = [{'A': f'{observed_fvals:.6f}'}]
+            if observed_fvals.dtype is float:
+                examples = [{'A': f'{observed_fvals:.6f}'}]
+            else:
+                examples = [{'A': f"{observed_fvals}"}]
         else:
             raise Exception
-            
         return examples
-    
 
     def _gen_prompt_tempates_acquisitions(
         self,
@@ -201,7 +205,7 @@ Hyperparameter configuration: {Q}"""
             if use_context == 'full_context':
                 if task == 'classification':
                     prefix += f" The model is evaluated on a tabular {task} task containing {n_classes} classes."
-                elif task == 'regression':
+                elif task in ['regression','quantile-prediction','rank-prediction']:
                     prefix += f" The model is evaluated on a tabular {task} task."
                 else:
                     raise Exception
@@ -246,14 +250,18 @@ Hyperparameter configuration: {Q}"""
                         prefix += f" (log scale, precise to {n_dp} decimals)"
                     else:
                         prefix += f" (int)"
-
                 elif constraint[0] == 'ordinal':
                     if use_feature_semantics:
                         prefix += f"- {hyperparameter}: "
                     else:
                         prefix += f"- X{i+1}: "
                     prefix += f" (ordinal, must take value in {constraint[2]})"
-
+                elif constraint[0] == 'categorical':
+                    if use_feature_semantics:
+                        prefix += f"- {hyperparameter}: "
+                    else:
+                        prefix += f"- X{i+1}: "
+                    prefix += f" (categorical, must take value in {constraint[2]})"
                 else:
                     raise Exception('Unknown hyperparameter value type') 
 
@@ -298,21 +306,55 @@ Hyperparameter configuration:"""
                 try:
                     start_time = time.time()
                     self.rate_limiter.add_request(request_text=user_message, current_time=start_time)
-                    resp = await openai.ChatCompletion.acreate(
-                        engine=self.chat_engine,
-                        messages=message,
-                        temperature=0.8,
-                        max_tokens=500,
-                        top_p=0.95,
-                        n=self.n_gens,
-                        request_timeout=10
-                    )
-                    self.rate_limiter.add_request(request_token_count=resp['usage']['total_tokens'], current_time=start_time)
+                    openai_kwargs = {'messages': message,
+                                     'temperature': 0.8,
+                                     'max_tokens': 500,
+                                     'top_p': 0.95,
+                                     'request_timeout': None, # Formerly 10
+                                    }
+                    if self.chat_engine in self.ollama_engines:
+                        # Ollama needs this to be the MODEL argument
+                        openai_kwargs.update({'model': self.chat_engine})
+                    else:
+                        # OpenAI API needs this to be the ENGINE argument
+                        openai_kwargs.update({'engine': self.chat_engine})
+                        # OpenAI API can generate multiple responses on this call
+                        openai_kwargs.update({'n': self.n_gens})
+                    resp = await openai.ChatCompletion.acreate(**openai_kwargs)
+                    self.rate_limiter.add_request(request_token_count=resp['usage']['total_tokens'], current_time=time.time())
+                    # Using Ollama, call multiple times for n_generations
+                    other_resps = []
+                    if self.chat_engine in self.ollama_engines:
+                        for i in range(self.n_gens-1):
+                            self.rate_limiter.add_request(request_text=user_message, current_time=time.time())
+                            # Ensure seeds change so you don't always get the exact same response
+                            if 'seed' in openai_kwargs:
+                                openai_kwargs['seed'] += 1
+                            bonus_resp = await openai.ChatCompletion.acreate(**openai_kwargs)
+                            self.rate_limiter.add_request(request_token_count=bonus_resp['usage']['total_tokens'], current_time=time.time())
+                            other_resps.append(bonus_resp)
+                    # Merge all responses
+                    new_index = len(resp.choices)
+                    for bonus in other_resps:
+                        choices_index = list(bonus.keys()).index('choices')
+                        usage_index = list(bonus.keys()).index('usage')
+                        choices = list(bonus.values())[choices_index]
+                        usage = list(bonus.values())[usage_index]
+                        for use_key, use_value in usage.items():
+                            setattr(resp.usage,use_key,getattr(resp.usage,use_key)+use_value)
+                        for choice in choices:
+                            choice.index = new_index
+                            new_index += 1
+                        resp.choices.extend(choices)
                     break
                 except Exception as e:
+                    self.logger.info(f'LLM generation attempt {retry+1}/{MAX_RETRIES} failed:'+str(e))
                     print(f'[AF] RETRYING LLM REQUEST {retry+1}/{MAX_RETRIES}...')
                     print(resp)
                     print(e)
+                    if retry == MAX_RETRIES-1:
+                        await openai.aiosession.get().close()
+                        raise e
 
         await openai.aiosession.get().close()
 
@@ -324,28 +366,35 @@ Hyperparameter configuration:"""
 
         return resp, tot_cost, tot_tokens
 
-
     async def _async_generate_concurrently(self, prompt_templates, query_templates):
         '''Perform concurrent generation of responses from the LLM async.'''
-
         coroutines = []
         for (prompt_template, query_template) in zip(prompt_templates, query_templates):
             coroutines.append(self._async_generate(prompt_template.format(A=query_template[0]['A'])))
 
+        results = [[] for _ in range(len(coroutines))]
+        # My machine cannot locally generate all of these at once, so rewrite this to be one-at-a-time please
+        for c in coroutines:
+            task = asyncio.create_task(c)
+            llm_response = await asyncio.gather(task)
+            for query_idx, response in enumerate(llm_response):
+                if response is not None:
+                    resp, tot_cost, tot_tokens = response
+                    results[query_idx].append([resp, tot_cost, tot_tokens])
+        # Old version that would generate all templates in parallel
+        """
         # coroutines = [self._async_generate(prompt_template.format(A=query_example['A'])) for prompt_template in prompt_templates]
         tasks = [asyncio.create_task(c) for c in coroutines]
 
         # assert len(tasks) == int(self.n_candidates/self.n_gens)
         assert len(tasks) == int(self.n_templates)
-
-        results = [None]*len(coroutines)
-
         llm_response = await asyncio.gather(*tasks)
 
         for idx, response in enumerate(llm_response):
             if response is not None:
                 resp, tot_cost, tot_tokens = response
                 results[idx] = (resp, tot_cost, tot_tokens)
+        """
 
         return results  # format [(resp, tot_cost, tot_tokens), None, (resp, tot_cost, tot_tokens)]
     
@@ -386,6 +435,9 @@ Hyperparameter configuration:"""
             elif value_type == 'ordinal':
                 # check that value is in allowed range up to 2 decimal places
                 return any(math.isclose(value, x, abs_tol=1e-2) for x in allowed_range[2])
+            elif value_type == 'categorical':
+                # check that the value is in allowed set
+                return value in allowed_range
             else:
                 raise Exception('Unknown hyperparameter value type')
 
@@ -465,6 +517,12 @@ Hyperparameter configuration:"""
 
         prompt_templates, query_templates = self._gen_prompt_tempates_acquisitions(observed_configs, observed_fvals, desired_fval, n_prompts=self.n_templates, use_context=use_context, use_feature_semantics=use_feature_semantics, shuffle_features=self.shuffle_features)
 
+        self.logger.info('='*100)
+        self.logger.info('EXAMPLE ACQUISITION PROMPT')
+        self.logger.info(f'Length of prompt templates: {len(prompt_templates)}')
+        self.logger.info(f'Length of query templates: {len(query_templates)}')
+        self.logger.info(prompt_templates[0].format(A=query_templates[0][0]['A']))
+        self.logger.info('='*100)
         print('='*100)
         print('EXAMPLE ACQUISITION PROMPT')
         print(f'Length of prompt templates: {len(prompt_templates)}')
@@ -487,16 +545,19 @@ Hyperparameter configuration:"""
                 if response is None:
                     continue
                 # loop through n_gen responses
-                for response_message in response[0]['choices']:
-                        response_content = response_message['message']['content']
-                        try:
-                            response_content = response_content.split('##')[1].strip()
-                            candidate_points.append(self._convert_to_json(response_content))
-                        except:
-                            print(response_content)
-                            continue
-                tot_cost += response[1]
-                tot_tokens += response[2]
+                import pdb
+                pdb.set_trace()
+                for response_group in response:
+                    for response_message in response_group[0]['choices']:
+                            response_content = response_message['message']['content']
+                            try:
+                                response_content = response_content.split('##')[1].strip()
+                                candidate_points.append(self._convert_to_json(response_content))
+                            except:
+                                print(response_content)
+                                continue
+                    tot_cost += response_group[1]
+                    tot_tokens += response_group[2]
 
             proposed_points = self._filter_candidate_points(observed_configs.to_dict(orient='records'), candidate_points)
             filtered_candidate_points = pd.concat([filtered_candidate_points, proposed_points], ignore_index=True)
@@ -504,7 +565,6 @@ Hyperparameter configuration:"""
 
             print(f'Attempt: {retry}, number of proposed candidate points: {len(candidate_points)}, ',
                   f'number of accepted candidate points: {filtered_candidate_points.shape[0]}')
-
 
             retry += 1
             if retry > 3:
@@ -520,8 +580,8 @@ Hyperparameter configuration:"""
         if self.warping_transformer is not None:
             filtered_candidate_points = self.warping_transformer.unwarp(filtered_candidate_points)
 
-
         end_time = time.time()
         time_taken = end_time - start_time
 
         return filtered_candidate_points, tot_cost, time_taken
+

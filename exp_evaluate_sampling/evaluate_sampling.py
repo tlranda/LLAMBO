@@ -26,6 +26,14 @@ def setup_logging(log_name):
     logger.addHandler(file_handler)
     logger.setLevel(logging.INFO)
 
+def load_precomputed_samples(hp_constraints, n, dataset_name, model, dataset):
+    # For purposes here, the train/test split does not matter, re-unify them
+    # Ignore the n-value for now, we may revisit that later
+    all_x = np.vstack((dataset['train_x'], dataset['test_x']))
+    all_y = np.hstack((dataset['train_y'], dataset['test_y']))
+    sampled_configs = pd.DataFrame(all_x, columns=list(hp_constraints.keys()))
+    sampled_scores = pd.DataFrame(all_y, columns=['score'])
+    return sampled_configs, sampled_scores
 
 def obtain_n_configurations(hp_constraints, n, dataset, model, 
                             task_metric, task_type, lower_is_better):
@@ -83,10 +91,13 @@ def obtain_n_configurations(hp_constraints, n, dataset, model,
     return configs, scores
 
 
-def sample_n_configurations(configs, scores, n, seed, existing_config=None):
+def sample_n_configurations(configs, scores, n, seed, existing_config=None, local_quantiles=False):
     '''Sample n configurations from configs and scores'''
     number_sampled = 0
     iter_i = 0
+
+    if local_quantiles:
+        score_quantiles = scores[['score']].rank(method='max').apply(lambda x: (x-1)/(len(scores)-1))
 
     sampled_configs = pd.DataFrame()
     sampled_scores = pd.DataFrame()
@@ -101,11 +112,20 @@ def sample_n_configurations(configs, scores, n, seed, existing_config=None):
     # avoid execessive duplication of configs - means observed configurations are not diverse enough
     # this leads to rank deficiency in covariance matrix
     while number_sampled < n:
-        # randomly sample from each unique score
-        sample_index = scores.groupby('score_rank').apply(lambda x: x.sample(1, random_state=seed+iter_i)).index.get_level_values(1)
+        if local_quantiles:
+            # randomly sample from uniform quantiles, but account for loop iteration in case existing_config denies certain values
+            sample_index = np.array([np.floor(len(scores)*(_/n)) for _ in range(n)], dtype=int) + iter_i
+            # If things get dropped due to existing_config, you may see less-uniform overall distribution, so shuffle the indices as a counteract
+            np.random.shuffle(sample_index)
+        else:
+            # randomly sample from each unique score
+            sample_index = scores.groupby('score_rank').apply(lambda x: x.sample(1, random_state=seed+iter_i)).index.get_level_values(1)
         # get sampled configs and scores
         sampled_configs = pd.concat([sampled_configs, configs.iloc[sample_index]], axis=0)
-        sampled_scores = pd.concat([sampled_scores, scores[['score']].iloc[sample_index]], axis=0)
+        if local_quantiles:
+            sampled_scores = pd.concat([sampled_scores, score_quantiles.iloc[sample_index]], axis=0)
+        else:
+            sampled_scores = pd.concat([sampled_scores, scores[['score']].iloc[sample_index]], axis=0)
         sampled_configs = sampled_configs.reset_index(drop=True)
         sampled_scores = sampled_scores.reset_index(drop=True)
 
@@ -143,12 +163,10 @@ def evaluate_proposals(candidates, observed, model, task_type, task_metric,
     model_ = get_bayesmark_func(model, task_type)
     candidate_scores = []
     for config in candidates:
-
         if hp_constraints is not None:
             for hyperparam, value in config.items():
                 if hp_constraints[hyperparam][0] == 'int':
                     config[hyperparam] = int(value)
-
 
         train_x = dataset['train_x']
         test_x = dataset['test_x']
@@ -206,42 +224,50 @@ def evaluate_proposals(candidates, observed, model, task_type, task_metric,
 
     return av_regret, best_regret, perf_spread, ml_dist, gen_var, ll, candidate_scores
 
-
-
-
 TASK_MAP = {
     'breast': ['classification', 'accuracy'],
     'digits': ['classification', 'accuracy'],
     'wine': ['classification', 'accuracy'],
     'iris': ['classification', 'accuracy'],
     'diabetes': ['regression', 'neg_mean_squared_error'],
+    'syr2k': ['regression', 'neg_mean_squared_error'],
+    'syr2k_q': ['quantile-prediction', 'quantile'],
+    'syr2k_r': ['rank-prediction', 'rank out of 10648'],
 }
 
-
 if __name__ == '__main__':
+    # load hyperparameter config space
+    with open(f'hp_configurations/bayesmark.json', 'r') as f:
+        hp_constraints = json.load(f)
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='RandomForest')
-    parser.add_argument('--dataset', type=str, default='breast')
-    parser.add_argument('--num_observed', type=int, default=10)
-    parser.add_argument('--num_seeds', type=int, default=1)
-    parser.add_argument('--engine', type=str)
+    # Extensions:
+    # * DatasetIdentity:syr2k (tuning options for syr2k)
+    parser.add_argument('--model', type=str, choices=list(hp_constraints.keys()), help="Tunable parameters the LLM is asked to reason about")
+    # Extensions:
+    # * syr2k (syr2k data with actual objective data)
+    # * syr2k_q (syr2k data but with quantiles as objectives instead of actual objective)
+    # * syr2k_r (syr2k data but with ranks as objectives instead of actual objective)
+    parser.add_argument('--dataset', type=str, choices=list(TASK_MAP.keys()), help="Data from interacting with the model")
+    parser.add_argument('--num_observed', type=int, help="Number of ICL examples for the LLM")
+    parser.add_argument('--num_seeds', type=int, default=1, help="Number of LLM seeds to try (default: %(default)s)")
+    parser.add_argument('--num_candidates', type=int, default=10, help="Number of candidates for LLM to try (default: %(default)s)")
+    parser.add_argument('--engine', type=str, default='llama3', help="LLM model to use for inference (default: %(default)s)")
+    parser.add_argument('--evaluate', nargs='+', required=True, default=None, choices=['TPE_IN','TPE_MULTI','RANDOM','LLAMBO','LLAMBO_VANILLA'], help="Techniques to use during evaluation")
 
     args = parser.parse_args()
     model = args.model
     dataset_name = args.dataset
     num_observed = args.num_observed
+    num_candidates = args.num_candidates
     num_seeds = args.num_seeds
     engine = args.engine
+    to_evaluate = args.evaluate
 
-    # load hyperparameter config space
-    with open(f'hp_configurations/bayesmark.json', 'r') as f:
-        hp_constraints = json.load(f)[model]
-
+    hp_constraints = hp_constraints[model]
     task_map = TASK_MAP[dataset_name]
     task_type = task_map[0]
     task_metric = task_map[1]
-
-
     # define result save directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     save_res_fpath = f'{script_dir}/results/evaluate_sampling/{dataset_name}/{model}/{num_observed}.json'
@@ -260,25 +286,19 @@ if __name__ == '__main__':
     # load dataset
     pickle_fpath = f'bayesmark/data/{dataset_name}.pickle'
     with open(pickle_fpath, 'rb') as f:
-        dataset = pickle.load(f)
+        dataset_loaded = pickle.load(f)
 
     results = {}
-    results['TPE_IN'] = {'av_regret': [], 'best_regret': [], 'score_spread': [], 'ml_dist': [], 'gen_var': [], 'll': [],
-                      'proposed_points': [], 'proposed_points_evaluation': []}
-    results['TPE_MULTI'] = {'av_regret': [], 'best_regret': [], 'score_spread': [], 'ml_dist': [], 'gen_var': [], 'll': [],
-                      'proposed_points': [], 'proposed_points_evaluation': []}
-    results['RANDOM'] = {'av_regret': [], 'best_regret': [], 'score_spread': [], 'ml_dist': [], 'gen_var': [], 'll': [],
-                        'proposed_points': [], 'proposed_points_evaluation': []}
-    results['LLAMBO'] = {'av_regret': [], 'best_regret': [], 'score_spread': [], 'ml_dist': [], 'gen_var': [], 'll': [],
-                        'proposed_points': [], 'proposed_points_evaluation': []}
-
+    for evaluator in to_evaluate:
+        results[evaluator] = dict((key,list()) for key in ['av_regret','best_regret','score_spread','ml_dist','gen_var','ll','proposed_points','proposed_points_evaluation'])
     lower_is_better = False if task_metric == 'accuracy' else True
 
-
     logger.info(f'Collecting configurations - this might take a while...')
-    sampled_configs, sampled_scores = obtain_n_configurations(hp_constraints, 100, dataset, model, 
+    if model.startswith('DatasetIdentity:'):
+        sampled_configs, sampled_scores = load_precomputed_samples(hp_constraints, 100, dataset_loaded, model, dataset_loaded)
+    else:
+        sampled_configs, sampled_scores = obtain_n_configurations(hp_constraints, 100, dataset_loaded, model, 
                                                               task_metric=task_metric, task_type=task_type, lower_is_better=lower_is_better)
-    
 
     with open('bayesmark/data/global_perf.json', 'r') as f:
         global_perf = json.load(f)
@@ -292,99 +312,104 @@ if __name__ == '__main__':
         logger.info('='*200)
         logger.info(f'Evaluating sampling with seed {seed}...')
 
-        observed_configs, observed_fvals = sample_n_configurations(sampled_configs, sampled_scores, num_observed, seed=seed)
+        observed_configs, observed_fvals = sample_n_configurations(sampled_configs, sampled_scores, num_observed, seed=seed, local_quantiles=dataset_name.endswith('_q'))
+        logger.info("Observed_configs (ICL)")
+        logger.info(observed_configs)
+        logger.info("Observed_fvals (ICL)")
+        logger.info(observed_fvals)
+        logger.info('.'*50)
 
         # sample candidates from Independent TPE
-        model_covariance = False
-        candidates = sample_from_TPESampler(hp_constraints, lower_is_better, 20, 
-                                            model_covariance, observed_configs, observed_fvals)
-        # evaluate candidates
-        evaluation = evaluate_proposals(candidates, observed_configs, model, task_type, task_metric, dataset, lower_is_better, hp_constraints)
-        av_regret, best_regret, perf_spread, ml_dist, gen_var, ll, candidate_scores = evaluation
-        logger.info(f'[TPE_IN] Average regret: {av_regret:.4f}, Best regret: {best_regret:.4f}, '
-                    f'Score spread: {perf_spread:.4f}, Mahalanobis distance: {ml_dist:.4f}, '
-                    f'Gen var: {gen_var:.4f}, Log likelihood: {ll:.4f}')
-        results['TPE_IN']['av_regret'].append(av_regret)
-        results['TPE_IN']['best_regret'].append(best_regret)
-        results['TPE_IN']['score_spread'].append(perf_spread)
-        results['TPE_IN']['ml_dist'].append(ml_dist)
-        results['TPE_IN']['gen_var'].append(gen_var)
-        results['TPE_IN']['ll'].append(ll)
-        results['TPE_IN']['proposed_points'].append(candidates)
-        results['TPE_IN']['proposed_points_evaluation'].append(candidate_scores.tolist())
-
-
+        if 'TPE_IN' in to_evaluate:
+            model_covariance = False
+            candidates = sample_from_TPESampler(hp_constraints, lower_is_better, 20, 
+                                                model_covariance, observed_configs, observed_fvals)
+            # evaluate candidates
+            evaluation = evaluate_proposals(candidates, observed_configs, model, task_type, task_metric, dataset_loaded, lower_is_better, hp_constraints)
+            av_regret, best_regret, perf_spread, ml_dist, gen_var, ll, candidate_scores = evaluation
+            logger.info(f'[TPE_IN] Average regret: {av_regret:.4f}, Best regret: {best_regret:.4f}, '
+                        f'Score spread: {perf_spread:.4f}, Mahalanobis distance: {ml_dist:.4f}, '
+                        f'Gen var: {gen_var:.4f}, Log likelihood: {ll:.4f}')
+            results['TPE_IN']['av_regret'].append(av_regret)
+            results['TPE_IN']['best_regret'].append(best_regret)
+            results['TPE_IN']['score_spread'].append(perf_spread)
+            results['TPE_IN']['ml_dist'].append(ml_dist)
+            results['TPE_IN']['gen_var'].append(gen_var)
+            results['TPE_IN']['ll'].append(ll)
+            results['TPE_IN']['proposed_points'].append(candidates)
+            results['TPE_IN']['proposed_points_evaluation'].append(candidate_scores.tolist())
 
         # sample candidates from Multivariate TPE
-        model_covariance = True
-        candidates = sample_from_TPESampler(hp_constraints, lower_is_better, 20,
-                                            model_covariance, observed_configs, observed_fvals)
-        # evaluate candidates
-        evaluation = evaluate_proposals(candidates, observed_configs, model, task_type, task_metric, dataset, lower_is_better, hp_constraints)
-        av_regret, best_regret, perf_spread, ml_dist, gen_var, ll, candidate_scores = evaluation
-        logger.info(f'[TPE_MULTI] Average regret: {av_regret:.4f}, Best regret: {best_regret:.4f}, '
-                    f'Score spread: {perf_spread:.4f}, Mahalanobis distance: {ml_dist:.4f}, '
-                    f'Gen var: {gen_var:.4f}, Log likelihood: {ll:.4f}')
-        results['TPE_MULTI']['av_regret'].append(av_regret)
-        results['TPE_MULTI']['best_regret'].append(best_regret)
-        results['TPE_MULTI']['score_spread'].append(perf_spread)
-        results['TPE_MULTI']['ml_dist'].append(ml_dist)
-        results['TPE_MULTI']['gen_var'].append(gen_var)
-        results['TPE_MULTI']['ll'].append(ll)
-        results['TPE_MULTI']['proposed_points'].append(candidates)
-        results['TPE_MULTI']['proposed_points_evaluation'].append(candidate_scores.tolist())
-        
-
+        if 'TPE_MULTI' in to_evaluate:
+            model_covariance = True
+            candidates = sample_from_TPESampler(hp_constraints, lower_is_better, 20,
+                                                model_covariance, observed_configs, observed_fvals)
+            # evaluate candidates
+            evaluation = evaluate_proposals(candidates, observed_configs, model, task_type, task_metric, dataset_loaded, lower_is_better, hp_constraints)
+            av_regret, best_regret, perf_spread, ml_dist, gen_var, ll, candidate_scores = evaluation
+            logger.info(f'[TPE_MULTI] Average regret: {av_regret:.4f}, Best regret: {best_regret:.4f}, '
+                        f'Score spread: {perf_spread:.4f}, Mahalanobis distance: {ml_dist:.4f}, '
+                        f'Gen var: {gen_var:.4f}, Log likelihood: {ll:.4f}')
+            results['TPE_MULTI']['av_regret'].append(av_regret)
+            results['TPE_MULTI']['best_regret'].append(best_regret)
+            results['TPE_MULTI']['score_spread'].append(perf_spread)
+            results['TPE_MULTI']['ml_dist'].append(ml_dist)
+            results['TPE_MULTI']['gen_var'].append(gen_var)
+            results['TPE_MULTI']['ll'].append(ll)
+            results['TPE_MULTI']['proposed_points'].append(candidates)
+            results['TPE_MULTI']['proposed_points_evaluation'].append(candidate_scores.tolist())
 
         # sample candidates from Random sampler
-        candidates = sample_from_RandomSampler(hp_constraints, 20, seed=seed)
-        # evaluate candidates
-        evaluation = evaluate_proposals(candidates, observed_configs, model, task_type, task_metric, dataset, lower_is_better, hp_constraints)
-        av_regret, best_regret, perf_spread, ml_dist, gen_var, ll, candidate_scores = evaluation
-        logger.info(f'[RANDOM] Average regret: {av_regret:.4f}, Best regret: {best_regret:.4f}, '
-                    f'Score spread: {perf_spread:.4f}, Mahalanobis distance: {ml_dist:.4f}, '
-                    f'Gen var: {gen_var:.4f}, Log likelihood: {ll:.4f}')
-        results['RANDOM']['av_regret'].append(av_regret)
-        results['RANDOM']['best_regret'].append(best_regret)
-        results['RANDOM']['score_spread'].append(perf_spread)
-        results['RANDOM']['ml_dist'].append(ml_dist)
-        results['RANDOM']['gen_var'].append(gen_var)
-        results['RANDOM']['ll'].append(ll)
-        results['RANDOM']['proposed_points'].append(candidates)
-        results['RANDOM']['proposed_points_evaluation'].append(candidate_scores.tolist())
-
+        if 'RANDOM' in to_evaluate:
+            candidates = sample_from_RandomSampler(hp_constraints, 20, seed=seed)
+            # evaluate candidates
+            evaluation = evaluate_proposals(candidates, observed_configs, model, task_type, task_metric, dataset_loaded, lower_is_better, hp_constraints)
+            av_regret, best_regret, perf_spread, ml_dist, gen_var, ll, candidate_scores = evaluation
+            logger.info(f'[RANDOM] Average regret: {av_regret:.4f}, Best regret: {best_regret:.4f}, '
+                        f'Score spread: {perf_spread:.4f}, Mahalanobis distance: {ml_dist:.4f}, '
+                        f'Gen var: {gen_var:.4f}, Log likelihood: {ll:.4f}')
+            results['RANDOM']['av_regret'].append(av_regret)
+            results['RANDOM']['best_regret'].append(best_regret)
+            results['RANDOM']['score_spread'].append(perf_spread)
+            results['RANDOM']['ml_dist'].append(ml_dist)
+            results['RANDOM']['gen_var'].append(gen_var)
+            results['RANDOM']['ll'].append(ll)
+            results['RANDOM']['proposed_points'].append(candidates)
+            results['RANDOM']['proposed_points_evaluation'].append(candidate_scores.tolist())
 
         # sample candidates from LLM sampler
         task_context = {}
         task_context['model'] = model
         task_context['task'] = task_type
-        task_context['tot_feats'] = dataset['train_x'].shape[1]
+        task_context['tot_feats'] = dataset_loaded['train_x'].shape[1]
         task_context['cat_feats'] = 0
-        task_context['num_feats'] = dataset['train_x'].shape[1]
-        task_context['n_classes'] = len(np.unique(dataset['train_y']))
+        task_context['num_feats'] = dataset_loaded['train_x'].shape[1]
+        task_context['n_classes'] = len(np.unique(dataset_loaded['train_y']))
         task_context['metric'] = task_metric
-        task_context['num_samples'] = dataset['train_x'].shape[0]
+        task_context['num_samples'] = dataset_loaded['train_x'].shape[0]
         task_context['hyperparameter_constraints'] = hp_constraints
+
         # sample candidates
-        LLM_Sampler = LLM_ACQ(task_context, n_candidates=20, n_templates=5, lower_is_better=lower_is_better, rate_limiter=rate_limiter, chat_engine=engine)
-        candidates, tot_cost, time_taken = LLM_Sampler.get_candidate_points(observed_configs, observed_fvals, alpha=-0.2)
-        # evaluate candidates
-        candidates = candidates.to_dict('records')
-        evaluation = evaluate_proposals(candidates, observed_configs, model, task_type, task_metric, dataset, lower_is_better, hp_constraints)
-        av_regret, best_regret, perf_spread, ml_dist, gen_var, ll, candidate_scores = evaluation
-        logger.info(f'[LLAMBO] Average regret: {av_regret:.4f}, Best regret: {best_regret:.4f}, '
-                    f'Score spread: {perf_spread:.4f}, Mahalanobis distance: {ml_dist:.4f}, '
-                    f'Gen var: {gen_var:.4f}, Log likelihood: {ll:.4f}')
-        results['LLAMBO']['av_regret'].append(av_regret)
-        results['LLAMBO']['best_regret'].append(best_regret)
-        results['LLAMBO']['score_spread'].append(perf_spread)
-        results['LLAMBO']['ml_dist'].append(ml_dist)
-        results['LLAMBO']['gen_var'].append(gen_var)
-        results['LLAMBO']['ll'].append(ll)
-        results['LLAMBO']['proposed_points'].append(candidates)
-        results['LLAMBO']['proposed_points_evaluation'].append(candidate_scores.tolist())
-        # track costs
-        tot_llm_cost += tot_cost
+        if 'LLAMBO' in to_evaluate:
+            LLM_Sampler = LLM_ACQ(task_context, n_candidates=20, n_templates=5, lower_is_better=lower_is_better, rate_limiter=rate_limiter, chat_engine=engine, logger=logger)
+            candidates, tot_cost, time_taken = LLM_Sampler.get_candidate_points(observed_configs, observed_fvals, alpha=-0.2)
+            # evaluate candidates
+            candidates = candidates.to_dict('records')
+            evaluation = evaluate_proposals(candidates, observed_configs, model, task_type, task_metric, dataset_loaded, lower_is_better, hp_constraints)
+            av_regret, best_regret, perf_spread, ml_dist, gen_var, ll, candidate_scores = evaluation
+            logger.info(f'[LLAMBO] Average regret: {av_regret:.4f}, Best regret: {best_regret:.4f}, '
+                        f'Score spread: {perf_spread:.4f}, Mahalanobis distance: {ml_dist:.4f}, '
+                        f'Gen var: {gen_var:.4f}, Log likelihood: {ll:.4f}')
+            results['LLAMBO']['av_regret'].append(av_regret)
+            results['LLAMBO']['best_regret'].append(best_regret)
+            results['LLAMBO']['score_spread'].append(perf_spread)
+            results['LLAMBO']['ml_dist'].append(ml_dist)
+            results['LLAMBO']['gen_var'].append(gen_var)
+            results['LLAMBO']['ll'].append(ll)
+            results['LLAMBO']['proposed_points'].append(candidates)
+            results['LLAMBO']['proposed_points_evaluation'].append(candidate_scores.tolist())
+            # track costs
+            tot_llm_cost += tot_cost
 
         # save results
         with open(save_res_fpath, 'w') as f:
@@ -392,3 +417,4 @@ if __name__ == '__main__':
 
     logger.info('='*200)
     logger.info(f'[LLAMBO] {seed+1} evaluation runs complete! Total cost: ${tot_llm_cost:.4f}')
+
