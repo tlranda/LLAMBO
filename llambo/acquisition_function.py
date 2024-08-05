@@ -408,11 +408,17 @@ Hyperparameter configuration:"""
             
         return response_json
     
+    def precision_rounding(self, value, precision):
+        try:
+            return round(value, precision)
+        except:
+            return value
+
     def _filter_candidate_points(self, observed_points, candidate_points, precision=8):
         '''Filter candidate points that already exist in observed points. Also remove duplicates.'''
         # drop points that already exist in observed points
-        rounded_observed = [{key: round(value, precision) for key, value in d.items()} for d in observed_points]
-        rounded_candidate = [{key: round(value, precision) for key, value in d.items()} for d in candidate_points]
+        rounded_observed = [{key: self.precision_rounding(value, precision) for key, value in d.items()} for d in observed_points]
+        rounded_candidate = [{key: self.precision_rounding(value, precision) for key, value in d.items()} for d in candidate_points]
         filtered_candidates = [x for i, x in enumerate(candidate_points) if rounded_candidate[i] not in rounded_observed]
 
         def is_within_range(value, allowed_range):
@@ -545,14 +551,25 @@ Hyperparameter configuration:"""
                 if response is None:
                     continue
                 # loop through n_gen responses
-                import pdb
-                pdb.set_trace()
                 for response_group in response:
                     for response_message in response_group[0]['choices']:
                             response_content = response_message['message']['content']
+                            response_content = response_content.split('##')[1].strip()
                             try:
-                                response_content = response_content.split('##')[1].strip()
                                 candidate_points.append(self._convert_to_json(response_content))
+                            except:
+                                # Don't handle here, retry
+                                pass
+                            else:
+                                continue
+                            # If they use colon-notation similar to what I did
+                            try:
+                                comma_delimited = response_content.split(',')
+                                minidict = dict()
+                                for cd in comma_delimited:
+                                    key, value = cd.split(':')
+                                    minidict[key] = value
+                                candidate_points.append(minidict)
                             except:
                                 print(response_content)
                                 continue
